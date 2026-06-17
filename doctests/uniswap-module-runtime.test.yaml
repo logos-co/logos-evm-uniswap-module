@@ -186,7 +186,15 @@ sections:
           content: |
             { "tokens": [ { "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "decimals": 6 } ] }
       - title: "Call get_prices"
-        run: "./logos/bin/logoscore call uniswap_module get_prices 31337 @tokens.json"
+        # Retry on a transient RPC_FAILED — the first proxied cross-module call
+        # after load can hit a cold-replica transport race on loaded CI runners.
+        # get_prices is a pure read, so retrying is side-effect-free.
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call uniswap_module get_prices 31337 @tokens.json 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         code_block: "logoscore call uniswap_module get_prices 31337 @tokens.json"
         expect_contains:
           - "prices"
