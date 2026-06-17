@@ -1,0 +1,29 @@
+[package]
+name = "uniswap_module"
+version = "1.0.0"
+edition = "2021"
+description = "Logos Uniswap module — V2/V3/V4 prices (best-rate via Multicall) + V2/V3 swap building."
+rust-version = "1.89"
+
+[workspace]
+resolver = "3"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Offline ABI encode/decode, CREATE2 pool-address derivation, and price math.
+# No network here — the eth_call/multicall is issued by eth_rpc_module via modules().
+alloy = { version = "1", default-features = false, features = ["std", "sol-types"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[features]
+default = ["logos_module"]
+logos_module = ["dep:logos-rust-sdk"]
+
+[dev-dependencies]
+tempfile = "3"
