@@ -194,7 +194,7 @@ sections:
           - "3000"
       - title: "Stop the daemon and the mock node"
         run: |
-          ./logos/bin/logoscore stop
+          ./logos/bin/logoscore stop || true
           pkill -f mock_node.py 2>/dev/null || true
       - run: "sleep 2"
       - title: "Confirm the daemon has stopped"
