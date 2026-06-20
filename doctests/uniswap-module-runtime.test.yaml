@@ -47,7 +47,13 @@ sections:
     step: true
     steps:
       - title: "Build logoscore"
-        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
+        text: |
+          `uniswap_module` is `concurrency: "multi"`, so the daemon resolves its
+          deferred replies — build logoscore against logos-protocol ≥ 0.2 via the
+          `--override-input` (master, where 0.2 lives).
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --override-input logos-protocol 'github:logos-co/logos-protocol{release}' --override-input logos-liblogos/logos-protocol 'github:logos-co/logos-protocol{release}' --out-link ./logos"
+        code_block: |
+          nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
         check_file: "logos/bin/logoscore"
       - title: "Build lgpm"
         run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
