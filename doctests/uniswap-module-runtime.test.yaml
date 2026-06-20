@@ -1,0 +1,224 @@
+name: "Pricing Tokens with the Uniswap Module on logoscore"
+output: uniswap-module-runtime.md
+release: ""
+
+intro: |
+  `logos-evm-uniswap-module` is the **price oracle and swap router** for the
+  Logos multi-chain EVM wallet. It derives Uniswap pool addresses offline
+  (CREATE2), bundles every on-chain read into a **single Multicall3 `eth_call`**,
+  and returns best-rate token→ETH / token→USD prices across **Uniswap V2, V3 and
+  V4** — plus V2/V3 swap-transaction building. It is multi-chain and fully
+  configurable, and it talks to the network only through `eth_rpc_module`, so the
+  wallet's fail-closed proxy still governs every request.
+
+  This doc-test drives the module through a `logoscore` daemon. The pure pricing
+  math (CREATE2 derivation, `sqrtPriceX96`/reserve maths, best-rate selection,
+  Multicall3 encode/decode) is covered by the crate's unit tests; here we prove
+  the **runtime** path end-to-end against a **local mock JSON-RPC node** (no
+  external network, reproducible in CI):
+
+  1. Build/install the module (and its `eth_rpc_module` dependency) and start a
+     daemon.
+  2. Read the seeded multi-chain config — Ethereum, Optimism, Arbitrum, Base.
+  3. Configure a local chain and ask for a token price: the module builds a
+     Multicall3 batch, issues one `eth_call` through `eth_rpc_module` to the mock
+     node, decodes the pool reserves, and reports the USD price — a real
+     `get_prices` round-trip.
+
+what_you_build: "This `uniswap_module`, packaged as `.lgx`, installed with `lgpm` alongside `eth_rpc_module`, and driven through a `logoscore` daemon against a local mock node."
+
+what_you_learn:
+  - How the module ships a seeded, configurable multi-chain Uniswap deployment map
+  - How a token price is computed from a single Multicall3 batch issued via eth_rpc
+  - How token→USD is anchored on a stablecoin/WETH rate
+
+prerequisites:
+  - |
+    **Nix** with flakes enabled. Install from [nixos.org](https://nixos.org/download.html), then enable flakes:
+
+    ```bash
+    mkdir -p ~/.config/nix
+    echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
+    ```
+  - "**A Linux or macOS machine** with `python3` available (used to run the local mock JSON-RPC node)."
+
+sections:
+  - title: "Build logoscore and lgpm"
+    step: true
+    steps:
+      - title: "Build logoscore"
+        text: |
+          `uniswap_module` is `concurrency: "multi"`, so the daemon resolves its
+          deferred replies — build logoscore against logos-protocol ≥ 0.2 via the
+          `--override-input` (master, where 0.2 lives).
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --override-input logos-protocol 'github:logos-co/logos-protocol{release}' --override-input logos-liblogos/logos-protocol 'github:logos-co/logos-protocol{release}' --out-link ./logos"
+        code_block: |
+          nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
+        check_file: "logos/bin/logoscore"
+      - title: "Build lgpm"
+        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
+        check_file: "lgpm/bin/lgpm"
+
+  - title: "Build and install the modules"
+    step: true
+    text: |
+      The Uniswap module depends on `eth_rpc_module` (it issues its batched
+      `eth_call` through it), so we install both.
+    steps:
+      - title: "Build the eth-rpc module's .lgx"
+        run: "nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx' --no-write-lock-file -o eth-rpc-lgx"
+        code_block: |
+          nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx' -o eth-rpc-lgx
+        extra_run:
+          run: "ls eth-rpc-lgx/*.lgx"
+      - title: "Build the uniswap module's .lgx"
+        run: "nix build 'github:logos-co/logos-evm-uniswap-module{release}#lgx' --no-write-lock-file -o uniswap-lgx"
+        code_block: |
+          nix build 'github:logos-co/logos-evm-uniswap-module{release}#lgx' -o uniswap-lgx
+        extra_run:
+          run: "ls uniswap-lgx/*.lgx"
+      - title: "Seed the capability module"
+        run: |
+          mkdir -p modules
+          cp -RL ./logos/modules/. ./modules/
+        check_file: "modules/capability_module/manifest.json"
+      - title: "Install eth_rpc_module"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file eth-rpc-lgx/*.lgx"
+        expect_contains:
+          - "Installed to:"
+      - title: "Install uniswap_module"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file uniswap-lgx/*.lgx"
+        expect_contains:
+          - "Installed to:"
+      - title: "Confirm the installs"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules list"
+        expect_contains:
+          - "uniswap_module"
+          - "eth_rpc_module"
+
+  - title: "Start a mock JSON-RPC node"
+    step: true
+    text: |
+      A tiny local node that answers `eth_call` with a canned **Multicall3
+      `aggregate3` result**: a single Uniswap V2 `getReserves` return of
+      6,000,000 USDC against 2,000 WETH — i.e. 1 WETH = 3,000 USDC. The price the
+      module reports is derived from exactly these reserves, so the round-trip is
+      deterministic and offline.
+    steps:
+      - title: "Write the mock node"
+        file:
+          path: mock_node.py
+          content: |
+            import http.server, json
+            # aggregate3([{success:true, returnData: getReserves()}]) with
+            # reserve0 = 6_000_000e6 USDC, reserve1 = 2_000e18 WETH (1 WETH = 3000 USDC).
+            AGG3 = "0x00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000574fbde600000000000000000000000000000000000000000000000006c6b935b8bbd4000000000000000000000000000000000000000000000000000000000000000000000"
+            RES = {"eth_chainId": "0x7a69", "eth_call": AGG3, "eth_blockNumber": "0x10"}
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    n = int(self.headers.get('content-length', 0))
+                    req = json.loads(self.rfile.read(n) or b'{}')
+                    body = json.dumps({"jsonrpc": "2.0", "id": req.get("id", 1),
+                                       "result": RES.get(req.get("method"), "0x0")}).encode()
+                    self.send_response(200)
+                    self.send_header('content-length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                def log_message(self, *a): pass
+            http.server.HTTPServer(('127.0.0.1', 8601), H).serve_forever()
+      - title: "Start the mock node"
+        run: "sh -c 'python3 mock_node.py > mock.log 2>&1 &'"
+        code_block: "python3 mock_node.py &"
+      - run: "sleep 2"
+
+  - title: "Run the daemon and price a token"
+    step: true
+    steps:
+      - title: "Start the daemon"
+        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
+        code_block: "logoscore -D -m ./modules > logs.txt &"
+      - run: "sleep 3"
+      - title: "Load the modules"
+        run: |
+          ./logos/bin/logoscore load-module eth_rpc_module
+          ./logos/bin/logoscore load-module uniswap_module
+        expect_contains:
+          - "uniswap_module"
+      - title: "Read the seeded multi-chain config"
+        text: "The module ships sensible defaults for Ethereum, Optimism, Arbitrum and Base (chainId 8453)."
+        run: "./logos/bin/logoscore call uniswap_module get_chains"
+        code_block: "logoscore call uniswap_module get_chains"
+        expect_contains:
+          - "chains"
+          - "8453"
+      - title: "Configure the local chain (Uniswap side: V2-only)"
+        text: |
+          A local chain `31337` with just a V2 deployment and USDC as the
+          stablecoin — enough to price USDC→ETH from one pool read.
+        file:
+          path: uni_chain.json
+          content: |
+            {
+              "chainId": 31337,
+              "weth": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+              "stablecoins": ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"],
+              "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11",
+              "v2Factory": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
+              "v2InitCodeHash": "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"
+            }
+      - title: "Apply the Uniswap chain config"
+        run: "./logos/bin/logoscore call uniswap_module configure @uni_chain.json"
+        code_block: "logoscore call uniswap_module configure @uni_chain.json"
+        expect_contains:
+          - "true"
+      - title: "Point eth_rpc chain 31337 at the mock node"
+        file:
+          path: rpc_chain.json
+          content: |
+            { "endpoint": "http://127.0.0.1:8601", "proxyRequired": false }
+      - title: "Apply the eth_rpc chain config"
+        run: "./logos/bin/logoscore call eth_rpc_module set_chain_config 31337 @rpc_chain.json"
+        code_block: "logoscore call eth_rpc_module set_chain_config 31337 @rpc_chain.json"
+        expect_contains:
+          - "true"
+      - title: "Price USDC (Multicall3 round-trip through eth_rpc)"
+        text: |
+          `get_prices` builds the Multicall3 batch, issues one `eth_call` via
+          `eth_rpc_module` to the mock node, decodes the V2 reserves, and reports
+          token→ETH and token→USD. With 1 WETH = 3,000 USDC, USDC anchors USD and
+          **WETH prices at ≈ $3000**.
+        file:
+          path: tokens.json
+          content: |
+            { "tokens": [ { "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "decimals": 6 } ] }
+      - title: "Call get_prices"
+        # Retry on a transient RPC_FAILED — the first proxied cross-module call
+        # after load can hit a cold-replica transport race on loaded CI runners.
+        # get_prices is a pure read, so retrying is side-effect-free.
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call uniswap_module get_prices 31337 @tokens.json 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
+        code_block: "logoscore call uniswap_module get_prices 31337 @tokens.json"
+        expect_contains:
+          - "prices"
+          - "31337"
+          - "3000"
+      - title: "Stop the daemon and the mock node"
+        run: |
+          trap '' TERM
+          ./logos/bin/logoscore stop || true
+          pkill -f mock_node.py 2>/dev/null || true
+          true
+      - run: "sleep 2"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logoscore status || true"
+        expect_contains:
+          - '"status":"not_running"'
+        post_text: |
+          The reported $3000 WETH price is computed entirely from the mock's
+          reserves, decoded in-process — proof that the full path (Multicall3
+          batch → `eth_rpc_module` → node → reserve maths → USD anchoring) runs
+          end-to-end through the live module.
