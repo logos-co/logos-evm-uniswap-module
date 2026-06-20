@@ -8,38 +8,46 @@
 //!
 //! Compiled only with the default `logos_module` feature; the pure cores
 //! (`config`, `pricing`, `swap`) are tested with `cargo test --no-default-features`.
+//!
+//! `concurrency: "multi"` (metadata.json): every price/quote/swap method blocks on
+//! a Multicall3 `eth_call` through eth_rpc, so the module opts into concurrent
+//! dispatch — pricing several chains at once no longer serializes. The multi
+//! contract makes the generated trait take `&self` + `Send + Sync`; the config map
+//! lives behind a `RwLock` (read it, clone the chain, drop the lock, then call —
+//! `configure` is the only writer).
 
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::config::{ConfigStore, STABLE_DECIMALS};
+use crate::config::{ChainUniswap, ConfigStore, STABLE_DECIMALS};
 use crate::pricing::{self, parse_addr as parse_addr_opt};
 use crate::swap;
 
-pub trait UniswapModule: Send + 'static {
+pub trait UniswapModule: Send + Sync + 'static {
     /// Add or override a chain's Uniswap config (JSON of `ChainUniswap`).
-    fn configure(&mut self, chain_json: String) -> bool;
+    fn configure(&self, chain_json: String) -> bool;
     /// All configured chains (defaults + overrides).
-    fn get_chains(&mut self) -> String;
+    fn get_chains(&self) -> String;
     /// Token→ETH and token→USD prices for `{ "tokens": [{address, decimals}] }`,
     /// best-rate across V2/V3/V4, batched into one Multicall3 `eth_call`.
-    fn get_prices(&mut self, chain_id: i64, tokens_json: String) -> String;
+    fn get_prices(&self, chain_id: i64, tokens_json: String) -> String;
     /// Best swap quote for `{ tokenIn, tokenOut, amountIn }` (native = "ETH").
-    fn quote_swap(&mut self, chain_id: i64, params_json: String) -> String;
+    fn quote_swap(&self, chain_id: i64, params_json: String) -> String;
     /// Unsigned swap tx (router, value, data, +approval) for the best route.
-    fn build_swap(&mut self, chain_id: i64, params_json: String) -> String;
+    fn build_swap(&self, chain_id: i64, params_json: String) -> String;
 
-    fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
+    fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 
 #[derive(Default)]
 struct UniswapModuleImpl {
-    cfg: Option<ConfigStore>,
+    cfg: RwLock<Option<ConfigStore>>,
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -106,12 +114,35 @@ fn default_slippage_bps() -> u64 {
 }
 
 impl UniswapModuleImpl {
-    fn cfg(&mut self) -> Result<&mut ConfigStore, String> {
-        self.cfg.as_mut().ok_or_else(|| "uniswap not initialized (context not ready)".to_string())
+    /// Read the config under a shared lock (concurrent readers overlap). Clone out
+    /// what you need and let the guard drop before any blocking eth_rpc call.
+    fn with_cfg<R>(&self, f: impl FnOnce(&ConfigStore) -> R) -> Result<R, String> {
+        match self.cfg.read().unwrap().as_ref() {
+            Some(c) => Ok(f(c)),
+            None => Err("uniswap not initialized (context not ready)".to_string()),
+        }
+    }
+
+    /// Write the config (the only mutator is `configure`).
+    fn with_cfg_mut(&self, f: impl FnOnce(&mut ConfigStore) -> bool) -> bool {
+        match self.cfg.write().unwrap().as_mut() {
+            Some(c) => f(c),
+            None => false,
+        }
+    }
+
+    /// Look up + clone a chain's config under the read lock.
+    fn chain_cfg(&self, chain_id: i64) -> Result<ChainUniswap, String> {
+        match self.with_cfg(|c| c.chain(chain_id as u64).cloned()) {
+            Ok(Some(ch)) => Ok(ch),
+            Ok(None) => Err(format!("no uniswap config for chain {chain_id}")),
+            Err(e) => Err(e),
+        }
     }
 
     /// Issue `aggregate3(calls)` through eth_rpc and return per-call results.
-    fn run_multicall(&mut self, chain_id: i64, multicall3: &str, calls: &[(Address, Vec<u8>)]) -> Result<Vec<Option<Vec<u8>>>, String> {
+    /// Touches no module state, so no lock is held across the blocking call.
+    fn run_multicall(&self, chain_id: i64, multicall3: &str, calls: &[(Address, Vec<u8>)]) -> Result<Vec<Option<Vec<u8>>>, String> {
         if calls.is_empty() {
             return Ok(Vec::new());
         }
@@ -128,44 +159,39 @@ impl UniswapModuleImpl {
     }
 
     /// Quote `amount_in` of `token_in → token_out` across V2 + V3 fee tiers.
-    fn quote(&mut self, chain_id: i64, token_in: Address, token_out: Address, amount_in: U256) -> Result<swap::BestQuote, String> {
-        let (mc, batch) = {
-            let chain = self.cfg()?.chain(chain_id as u64).ok_or_else(|| format!("no uniswap config for chain {chain_id}"))?;
-            (chain.multicall3.clone(), swap::build_quote_batch(chain, token_in, token_out, amount_in))
-        };
-        let results = self.run_multicall(chain_id, &mc, &batch.calls)?;
+    fn quote(&self, chain_id: i64, token_in: Address, token_out: Address, amount_in: U256) -> Result<swap::BestQuote, String> {
+        let chain = self.chain_cfg(chain_id)?;
+        let batch = swap::build_quote_batch(&chain, token_in, token_out, amount_in);
+        let results = self.run_multicall(chain_id, &chain.multicall3, &batch.calls)?;
         swap::decode_best_quote(&batch, &results).ok_or_else(|| "no route found".to_string())
     }
 }
 
 impl UniswapModule for UniswapModuleImpl {
-    fn on_context_ready(&mut self, ctx: &RustModuleContext) {
+    fn on_context_ready(&self, ctx: &RustModuleContext) {
         let dir = std::path::PathBuf::from(&ctx.instance_persistence_path);
-        self.cfg = Some(ConfigStore::with_path(dir.join("config.json")));
+        *self.cfg.write().unwrap() = Some(ConfigStore::with_path(dir.join("config.json")));
     }
 
-    fn configure(&mut self, chain_json: String) -> bool {
-        let chain: crate::config::ChainUniswap = match serde_json::from_str(&chain_json) {
+    fn configure(&self, chain_json: String) -> bool {
+        let chain: ChainUniswap = match serde_json::from_str(&chain_json) {
             Ok(c) => c,
             Err(_) => return false,
         };
-        match self.cfg() {
-            Ok(cfg) => {
-                cfg.set_chain(chain);
-                true
-            }
-            Err(_) => false,
-        }
+        self.with_cfg_mut(|cfg| {
+            cfg.set_chain(chain);
+            true
+        })
     }
 
-    fn get_chains(&mut self) -> String {
-        match self.cfg() {
-            Ok(cfg) => json!({ "ok": true, "chains": cfg.all() }).to_string(),
+    fn get_chains(&self) -> String {
+        match self.with_cfg(|c| json!({ "ok": true, "chains": c.all() }).to_string()) {
+            Ok(s) => s,
             Err(e) => err(e),
         }
     }
 
-    fn get_prices(&mut self, chain_id: i64, tokens_json: String) -> String {
+    fn get_prices(&self, chain_id: i64, tokens_json: String) -> String {
         let req: PricesReq = match serde_json::from_str(&tokens_json) {
             Ok(r) => r,
             Err(e) => return err(e),
@@ -173,7 +199,7 @@ impl UniswapModule for UniswapModuleImpl {
 
         // Resolve chain config, WETH, stablecoins (priced too, to anchor USD).
         let (mc, weth, stable_addrs, batch) = {
-            let chain = match self.cfg().and_then(|c| c.chain(chain_id as u64).cloned().ok_or_else(|| format!("no uniswap config for chain {chain_id}"))) {
+            let chain = match self.chain_cfg(chain_id) {
                 Ok(c) => c,
                 Err(e) => return err(e),
             };
@@ -224,7 +250,7 @@ impl UniswapModule for UniswapModuleImpl {
         json!({ "ok": true, "chainId": chain_id, "prices": out }).to_string()
     }
 
-    fn quote_swap(&mut self, chain_id: i64, params_json: String) -> String {
+    fn quote_swap(&self, chain_id: i64, params_json: String) -> String {
         let p: SwapReq = match serde_json::from_str(&params_json) {
             Ok(p) => p,
             Err(e) => return err(e),
@@ -245,7 +271,7 @@ impl UniswapModule for UniswapModuleImpl {
         }
     }
 
-    fn build_swap(&mut self, chain_id: i64, params_json: String) -> String {
+    fn build_swap(&self, chain_id: i64, params_json: String) -> String {
         let p: SwapReq = match serde_json::from_str(&params_json) {
             Ok(p) => p,
             Err(e) => return err(e),
@@ -275,7 +301,7 @@ impl UniswapModule for UniswapModuleImpl {
         let deadline = if p.deadline > 0 { p.deadline } else { now_secs() + 1200 };
 
         let built = {
-            let chain = match self.cfg().and_then(|c| c.chain(chain_id as u64).cloned().ok_or_else(|| "no config".to_string())) {
+            let chain = match self.chain_cfg(chain_id) {
                 Ok(c) => c,
                 Err(e) => return err(e),
             };

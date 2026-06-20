@@ -5,6 +5,7 @@
   "author": "Logos Core Team",
   "type": "core",
   "interface": "cdylib",
+  "concurrency": "multi",
   "category": "wallet",
   "main": "uniswap_module_plugin",
   "dependencies": ["eth_rpc_module"],
