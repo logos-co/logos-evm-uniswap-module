@@ -842,14 +842,15 @@
           "logos-module-builder",
           "logos-nix",
           "nixpkgs"
-        ]
+        ],
+        "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1781963359,
-        "narHash": "sha256-qyHTX+zSVGMVeZE85YHT7X4s7Sf9XBUioNvGO4iSpJs=",
+        "lastModified": 1782083712,
+        "narHash": "sha256-Pfm1dW38HNpnohJgY+g3V9i0Li9f6xD5fwB+y7ZiIZI=",
         "owner": "logos-co",
         "repo": "logos-module-builder",
-        "rev": "7bcd2def356ed8f37ebbbe007bbc7094f796907e",
+        "rev": "42aaf22c3af9cb8e5842a2df6eece3b4627a9ac3",
         "type": "github"
       },
       "original": {
@@ -4350,11 +4351,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1781895282,
-        "narHash": "sha256-3tTpCVDKTXNoYWUTPr5WOdw5m/46SrlHMbXQaGMVEFA=",
+        "lastModified": 1782082589,
+        "narHash": "sha256-Qeqxp0HYb3oTpmfD5YlFPJzpAJa7Ilb9o4sMeVvmHRI=",
         "owner": "logos-co",
         "repo": "logos-protocol",
-        "rev": "4ea32a314a38aeee4fbc390ba2cf852a2c7f92eb",
+        "rev": "315a3a2e0af61bc47aad5601ee44cd7689975820",
         "type": "github"
       },
       "original": {
@@ -4567,17 +4568,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1781897494,
-        "narHash": "sha256-4WsMEAD86C5cDMKC3jC8dA2AtMBgJxYdeep8z2swob4=",
+        "lastModified": 1782045655,
+        "narHash": "sha256-fprp1M+5opx3nfqAW+2HKcRUQyc+zqxsOxdNvpJFFv0=",
         "owner": "logos-co",
         "repo": "logos-rust-sdk",
-        "rev": "eff1ad5f039e37eaab88a845ac8d4529cb58c2ff",
+        "rev": "9957a9dd81c38c27e7021b623709129d3a4b7476",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
         "repo": "logos-rust-sdk",
-        "rev": "eff1ad5f039e37eaab88a845ac8d4529cb58c2ff",
+        "rev": "9957a9dd81c38c27e7021b623709129d3a4b7476",
         "type": "github"
       }
     },
@@ -8051,6 +8052,27 @@
       "inputs": {
         "eth_rpc_module": "eth_rpc_module",
         "logos-module-builder": "logos-module-builder"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "logos-module-builder",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1782012058,
+        "narHash": "sha256-9mWUnReOUXfKjZuJAL/bAFH3LUyECTRtXgSNVjRw3UY=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "8534567325bd8a8d2928e6afd81e0a87d19efd3c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
       }
     }
   },
