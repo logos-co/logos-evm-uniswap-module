@@ -118,7 +118,7 @@ sections:
         file:
           path: mock_node.py
           content: |
-            import http.server, json
+            import http.server, json, socketserver, time
             # aggregate3([{success:true, returnData: getReserves()}]) with
             # reserve0 = 6_000_000e6 USDC, reserve1 = 2_000e18 WETH (1 WETH = 3000 USDC).
             AGG3 = "0x00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000574fbde600000000000000000000000000000000000000000000000006c6b935b8bbd4000000000000000000000000000000000000000000000000000000000000000000000"
@@ -134,7 +134,22 @@ sections:
                     self.end_headers()
                     self.wfile.write(body)
                 def log_message(self, *a): pass
-            http.server.HTTPServer(('127.0.0.1', 8601), H).serve_forever()
+            # Threaded because uniswap_module is concurrency: "multi" and opens a fresh
+            # connection per call, so a single-threaded server would serialise them.
+            class Node(http.server.ThreadingHTTPServer):
+                # HTTPServer.server_bind() looks the host up in reverse DNS BETWEEN bind() and
+                # listen(), and nothing here needs the FQDN. Until that lookup answers the port
+                # is bound but not yet listening, so a caller's connect never completes; on a CI
+                # box whose resolver drops reverse queries for 127.0.0.1 that reads as an
+                # unreachable node. Same fix, same reason, as the eth-rpc-module spec.
+                def server_bind(self):
+                    socketserver.TCPServer.server_bind(self)
+                    self.server_name, self.server_port = self.server_address[:2]
+            t0 = time.time()
+            srv = Node(('127.0.0.1', 8601), H)
+            host, port = srv.server_address[:2]
+            print('listening on %s:%d after %.1fs' % (host, port, time.time() - t0), flush=True)
+            srv.serve_forever()
       - title: "Start the mock node"
         run: "sh -c 'python3 mock_node.py > mock.log 2>&1 &'"
         code_block: "python3 mock_node.py &"
