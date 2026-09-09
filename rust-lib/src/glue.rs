@@ -1,7 +1,7 @@
 //! Logos module glue for `uniswap_module` (rust-first authoring).
 //!
 //! Depends on `eth_rpc_module` (declared in metadata.json `dependencies`),
-//! reached as `modules().eth_rpc_module.call(chainId, callJson)`. This module is
+//! reached as `modules().eth_rpc_module.call(chainId, callJson, deadlineMs)`. This module is
 //! the wallet's **price oracle and swap router**: it derives pool addresses
 //! offline, bundles every read into one Multicall3 `eth_call`, and returns
 //! token→ETH / token→USD prices and best-rate swap quotes/transactions.
@@ -148,7 +148,7 @@ impl UniswapModuleImpl {
         }
         let data = pricing::multicall3_aggregate3_calldata(calls);
         let call_json = json!({ "to": multicall3, "data": format!("0x{}", hex::encode(data)) }).to_string();
-        let resp = modules().eth_rpc_module.call(chain_id, &call_json).map_err(|e| e.to_string())?;
+        let resp = modules().eth_rpc_module.call(chain_id, &call_json, None).map_err(|e| e.to_string())?;
         let v: Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
         if v.get("ok").and_then(Value::as_bool) == Some(false) {
             return Err(v.get("error").and_then(Value::as_str).unwrap_or("eth_call failed").to_string());
