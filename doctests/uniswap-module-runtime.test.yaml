@@ -206,7 +206,14 @@ sections:
       - title: "Start the daemon"
         run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
         code_block: "logoscore -D -m ./modules > logs.txt &"
-      - run: "sleep 3"
+      # The daemon writes its client config once it has booted, and a loaded machine can
+      # take longer than a fixed sleep: wait for the file rather than for a number.
+      - run: |
+          for i in $(seq 1 60); do
+            [ -f .logoscore/client/config.json ] && break
+            sleep 1
+          done
+          sleep 1
       - title: "Load the modules"
         run: |
           ./logos/bin/logoscore load-module eth_rpc_module
