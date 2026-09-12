@@ -1,21 +1,11 @@
 //! Uniswap quoting and swap encoding: pure and offline, like `pricing`.
 //!
-//! A quote is one Multicall3 batch: every candidate route (V2 direct, V2 via WETH, V3 direct
-//! per fee tier, V3 via WETH per tier pair) is asked for the amount and for a PROBE — a
-//! thousandth of it — whose rate stands in for the marginal price, so the price impact of the
-//! real amount is `1 - rate / probeRate`. The same batch reads the owner's balance of the
-//! input token and its allowance for the router, so one round trip says whether the swap
-//! can be paid for and whether an approval must go first. The glue issues the batch through
-//! `eth_rpc_module`; this file only builds calldata and reads bytes.
-//!
-//! Swaps are encoded for the LEGACY V2 router (`swapExact*`, which carry a deadline) and for
-//! **SwapRouter02** on V3: its `exactInput*` calls carry no deadline, so every V3 swap is
-//! wrapped in `multicall(deadline, bytes[])`, which checks it. Native ETH is `address(0)`
-//! here; it becomes WETH in every path, the transaction's `value` carries it in, and on the
-//! way out V3 swaps land in the router (`address(2)`) and `unwrapWETH9` hands ether to the
-//! recipient in the same multicall.
-//!
-//! Nothing here holds a key or picks a chain. `tx_sender_module` does the sending.
+//! A quote is one Multicall3 batch: every candidate route (V2 direct and via WETH, V3 direct
+//! per fee tier and via WETH per tier pair) is asked for the amount and for a PROBE of a
+//! thousandth of it, whose rate stands in for the marginal price; the same batch reads the
+//! owner's balance and allowances. V2 swaps go to the legacy router; V3 swaps go to
+//! SwapRouter02 wrapped in `multicall(deadline, …)`, ether out unwrapped in the same call.
+//! Nothing here holds a key or picks a chain; `tx_sender_module` does the sending.
 
 use alloy::primitives::aliases::{U160, U24};
 use alloy::primitives::{Address, Bytes, U256};

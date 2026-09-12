@@ -1,21 +1,11 @@
-//! Logos module glue for `uniswap_module` (rust-first authoring).
+//! Logos module glue for `uniswap_module`: the wallet's price oracle and swap quoter/encoder,
+//! reached through `eth_rpc_module` alone. It holds no key and sends nothing; a consumer
+//! hands the calls it builds to `tx_sender_module`. Compiled only with the `logos_module`
+//! feature; the pure cores are tested with `cargo test --no-default-features`.
 //!
-//! Depends on `eth_rpc_module` (declared in metadata.json `dependencies`), reached as
-//! `modules().eth_rpc_module.call_with_timeout(chainId, callJson, deadlineMs, budget)`. This
-//! module is the wallet's **price oracle and swap quoter/encoder**: it derives pool
-//! addresses offline, bundles every read into one Multicall3 `eth_call`, and returns
-//! token→ETH / token→USD prices and best-rate swap quotes with the calls that make them.
-//! It holds no key and sends nothing: a consumer hands the calls to `tx_sender_module`.
-//!
-//! Compiled only with the default `logos_module` feature; the pure cores
-//! (`config`, `pricing`, `swap`) are tested with `cargo test --no-default-features`.
-//!
-//! `concurrency: "multi"` (metadata.json): every price/quote/swap method blocks on
-//! a Multicall3 `eth_call` through eth_rpc, so the module opts into concurrent
-//! dispatch — pricing several chains at once no longer serializes. The multi
-//! contract makes the generated trait take `&self` + `Send + Sync`; the config map
-//! lives behind a `RwLock` (read it, clone the chain, drop the lock, then call —
-//! `configure` is the only writer).
+//! `concurrency: "multi"`: every method blocks on a Multicall3 `eth_call`, so dispatch is
+//! concurrent. The config map lives behind a `RwLock` — read it, clone the chain, drop the
+//! lock, then call. `configure` is the only writer.
 
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
