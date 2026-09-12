@@ -58,7 +58,7 @@ struct UniswapModuleImpl {
 
 /// One Multicall3 read through eth_rpc. A quote batch is tens of quoter calls, which a
 /// public node answers in a second or two; the verified proxy adds a proof round trip.
-const RPC_BUDGET: Duration = Duration::from_millis(9_000);
+const RPC_BUDGET: Duration = Duration::from_millis(15_000);
 
 /// The deadline handed to eth_rpc: the budget less the margin the transport itself needs.
 fn callee_deadline(t: Duration) -> Option<i64> {
