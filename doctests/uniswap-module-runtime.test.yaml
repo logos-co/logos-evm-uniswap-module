@@ -1,15 +1,16 @@
-name: "Pricing Tokens with the Uniswap Module on logoscore"
+name: "Pricing and Quoting Swaps with the Uniswap Module on logoscore"
 output: uniswap-module-runtime.md
 release: ""
 
 intro: |
-  `logos-evm-uniswap-module` is the **price oracle and swap router** for the
-  Logos multi-chain EVM wallet. It derives Uniswap pool addresses offline
-  (CREATE2), bundles every on-chain read into a **single Multicall3 `eth_call`**,
-  and returns best-rate token→ETH / token→USD prices across **Uniswap V2, V3 and
-  V4** — plus V2/V3 swap-transaction building. It is multi-chain and fully
-  configurable, and it talks to the network only through `eth_rpc_module`, so the
-  wallet's fail-closed proxy still governs every request.
+  `logos-evm-uniswap-module` is the **price oracle and swap quoter** for the
+  Logos EVM wallet. It derives Uniswap pool addresses offline (CREATE2), bundles
+  every on-chain read into a **single Multicall3 `eth_call`**, and returns
+  best-rate token→ETH / token→USD prices across **Uniswap V2, V3 and V4** — plus
+  V2/V3 swap quotes and the calls that make them. It holds no key and sends
+  nothing: a swap app hands the calls it builds to `tx_sender_module`. It is
+  multi-chain and fully configurable, and it talks to the network only through
+  `eth_rpc_module`, so the wallet's fail-closed proxy still governs every request.
 
   This doc-test drives the module through a `logoscore` daemon. The pure pricing
   math (CREATE2 derivation, `sqrtPriceX96`/reserve maths, best-rate selection,
@@ -19,18 +20,24 @@ intro: |
 
   1. Build/install the module (and its `eth_rpc_module` dependency) and start a
      daemon.
-  2. Read the seeded multi-chain config — Ethereum, Optimism, Arbitrum, Base.
+  2. Read the seeded multi-chain config — Ethereum, Sepolia, Optimism, Arbitrum,
+     Base.
   3. Configure a local chain and ask for a token price: the module builds a
      Multicall3 batch, issues one `eth_call` through `eth_rpc_module` to the mock
      node, decodes the pool reserves, and reports the USD price — a real
      `get_prices` round-trip.
+  4. Quote a swap for an account and build it: one more Multicall3 batch reads
+     the route quotes, a price-impact probe, the account's balance and its
+     allowance — and the reply carries the approve-then-swap calls a sender
+     needs, with a price impact and a gas hint for each.
 
-what_you_build: "This `uniswap_module`, packaged as `.lgx`, installed with `lgpm` alongside `eth_rpc_module`, and driven through a `logoscore` daemon against a local mock node."
+what_you_build: "This `uniswap_module`, packaged as `.lgx`, installed with `lgpm` alongside `eth_rpc_module`, and driven through a `logoscore` daemon against a local mock node: a price, a swap quote, and the swap's calls."
 
 what_you_learn:
   - How the module ships a seeded, configurable multi-chain Uniswap deployment map
   - How a token price is computed from a single Multicall3 batch issued via eth_rpc
   - How token→USD is anchored on a stablecoin/WETH rate
+  - What a swap quote carries, and why the module builds calls rather than sending them
 
 prerequisites:
   - |
@@ -108,27 +115,65 @@ sections:
   - title: "Start a mock JSON-RPC node"
     step: true
     text: |
-      A tiny local node that answers `eth_call` with a canned **Multicall3
-      `aggregate3` result**: a single Uniswap V2 `getReserves` return of
-      6,000,000 USDC against 2,000 WETH — i.e. 1 WETH = 3,000 USDC. The price the
-      module reports is derived from exactly these reserves, so the round-trip is
-      deterministic and offline.
+      A tiny local node that plays one Uniswap V2 pool: 6,000,000 USDC against
+      2,000 WETH — i.e. 1 WETH = 3,000 USDC. It decodes the **Multicall3
+      `aggregate3`** batch the module sends and answers each sub-call from those
+      reserves: `getReserves` for pricing, `getAmountsOut` for quotes (constant
+      product, so a bigger trade gets a worse rate — that is the price impact),
+      and the account reads `balanceOf` (5,000,000 USDC) and `allowance` (0). The
+      figures the module reports are derived from exactly these numbers, so the
+      round-trip is deterministic and offline.
     steps:
       - title: "Write the mock node"
         file:
           path: mock_node.py
           content: |
             import http.server, json, socketserver, time
-            # aggregate3([{success:true, returnData: getReserves()}]) with
-            # reserve0 = 6_000_000e6 USDC, reserve1 = 2_000e18 WETH (1 WETH = 3000 USDC).
-            AGG3 = "0x00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000574fbde600000000000000000000000000000000000000000000000006c6b935b8bbd4000000000000000000000000000000000000000000000000000000000000000000000"
-            RES = {"eth_chainId": "0x7a69", "eth_call": AGG3, "eth_blockNumber": "0x10"}
+            R0, R1 = 6_000_000 * 10**6, 2_000 * 10**18   # USDC, WETH reserves
+            def word(b, i): return int.from_bytes(b[32*i:32*i+32], 'big')
+            def enc(*ws): return b''.join(w.to_bytes(32, 'big') for w in ws)
+            def enc_bytes(b): return enc(len(b)) + b + b'\0' * (-len(b) % 32)
+            def sub(data):                     # one Call3's callData -> its returnData
+                sel, args = data[:4].hex(), data[4:]
+                if sel == '0902f1ac':          # getReserves()
+                    return enc(R0, R1, 0)
+                if sel == 'd06ca61f':          # getAmountsOut(amountIn, path[])
+                    a = word(args, 0); n = word(args, word(args, 1) // 32)
+                    out = R1 * a // (R0 + a)   # constant product, no fee
+                    return enc(0x20, n, *([a] * (n - 1)), out)
+                if sel == '70a08231':          # balanceOf(owner)
+                    return enc(5_000_000 * 10**6)
+                if sel == 'dd62ed3e':          # allowance(owner, spender)
+                    return enc(0)
+                if sel == '4d2301cc':          # getEthBalance(addr)
+                    return enc(10**18)
+                return None
+            def aggregate3(calldata):          # aggregate3(Call3[]) -> Result3[]
+                body = calldata[4:]
+                arr = word(body, 0); n = word(body, arr // 32)
+                base = arr + 32; results = []
+                for i in range(n):
+                    t = base + word(body, (base + 32 * i) // 32)
+                    off = word(body, (t + 64) // 32); ln = word(body, (t + off) // 32)
+                    ret = sub(body[t + off + 32:t + off + 32 + ln])
+                    results.append((1, ret) if ret is not None else (0, b''))
+                # Result3 is a dynamic tuple: an offset per element, then (success, bytes).
+                elems = [enc(ok, 0x40) + enc_bytes(ret) for ok, ret in results]
+                offs, acc = [], 32 * n
+                for e in elems: offs.append(acc); acc += len(e)
+                return '0x' + (enc(0x20, n, *offs) + b''.join(elems)).hex()
+            def eth_call(params):
+                call = params[0] if params else {}
+                data = bytes.fromhex((call.get('data') or call.get('input') or '0x')[2:])
+                return aggregate3(data) if data[:4].hex() == '82ad56cb' else '0x'
             class H(http.server.BaseHTTPRequestHandler):
                 def do_POST(self):
                     n = int(self.headers.get('content-length', 0))
                     req = json.loads(self.rfile.read(n) or b'{}')
-                    body = json.dumps({"jsonrpc": "2.0", "id": req.get("id", 1),
-                                       "result": RES.get(req.get("method"), "0x0")}).encode()
+                    m = req.get("method")
+                    if m == "eth_call": res = eth_call(req.get("params", [{}]))
+                    else: res = {"eth_chainId": "0x7a69", "eth_blockNumber": "0x10"}.get(m, "0x0")
+                    body = json.dumps({"jsonrpc": "2.0", "id": req.get("id", 1), "result": res}).encode()
                     self.send_response(200)
                     self.send_header('content-length', str(len(body)))
                     self.end_headers()
@@ -169,16 +214,22 @@ sections:
         expect_contains:
           - "uniswap_module"
       - title: "Read the seeded multi-chain config"
-        text: "The module ships sensible defaults for Ethereum, Optimism, Arbitrum and Base (chainId 8453)."
+        text: |
+          The module ships sensible defaults for Ethereum, Sepolia (chainId
+          11155111), Optimism, Arbitrum and Base (chainId 8453). Every V3 router
+          in the seed is **SwapRouter02**.
         run: "./logos/bin/logoscore call uniswap_module get_chains"
         code_block: "logoscore call uniswap_module get_chains"
         expect_contains:
           - "chains"
           - "8453"
+          - "11155111"
+          - "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"
       - title: "Configure the local chain (Uniswap side: V2-only)"
         text: |
           A local chain `31337` with just a V2 deployment and USDC as the
-          stablecoin — enough to price USDC→ETH from one pool read.
+          stablecoin — enough to price USDC→ETH from one pool read, and to quote
+          a USDC→ETH swap through the V2 router.
         file:
           path: uni_chain.json
           content: |
@@ -188,7 +239,8 @@ sections:
               "stablecoins": ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"],
               "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11",
               "v2Factory": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
-              "v2InitCodeHash": "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"
+              "v2InitCodeHash": "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f",
+              "v2Router": "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
             }
       - title: "Apply the Uniswap chain config"
         run: "./logos/bin/logoscore call uniswap_module configure @uni_chain.json"
@@ -230,6 +282,77 @@ sections:
           - "prices"
           - "31337"
           - "3000"
+
+  - title: "Quote a swap and build it"
+    step: true
+    text: |
+      A swap request names the pair, the amount in base units, and the `owner`
+      — the account that pays. With an owner the one Multicall3 batch also reads
+      that account's balance of the input token and its allowance for the router,
+      so the reply says whether the swap can be paid for and whether an
+      **approval must go first**. Beside every route's quote rides a **probe** of a
+      thousandth of the amount: its rate stands in for the marginal price, and
+      the shortfall of the real rate against it is the **price impact**.
+    steps:
+      - title: "Ask for 1,000 USDC worth of ether"
+        file:
+          path: swap.json
+          content: |
+            {
+              "tokenIn": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+              "tokenOut": "ETH",
+              "amountIn": "1000000000",
+              "owner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+              "symbolIn": "USDC",
+              "symbolOut": "ETH"
+            }
+      - title: "Quote the swap"
+        text: |
+          The winning route is V2 direct (the only one this chain has). The
+          reply carries the output, the route, the pool fee, the price impact
+          in basis points, a gas hint, and the owner's balance and allowance —
+          which is zero, so `needsApproval` is `true`.
+        run: "./logos/bin/logoscore call uniswap_module quote_swap 31337 @swap.json"
+        code_block: "logoscore call uniswap_module quote_swap 31337 @swap.json"
+        expect_contains:
+          - '"amountOut":"333277787035494084"'
+          - '"version":"V2"'
+          - '"viaWeth":false'
+          - '"feeBps":30'
+          - '"priceImpactBps":2'
+          - '"balanceIn":"5000000000000"'
+          - '"allowance":"0"'
+          - '"needsApproval":true'
+          - '"approval":"set"'
+          - '"spender":"0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"'
+      - title: "Build the swap"
+        text: |
+          The same quote, plus the calls that make it, **in the order they must
+          land**: an exact-amount `approve` of USDC for the router, then the
+          router call, with `amountOutMin` at the default 0.5% slippage. Each
+          call carries a gas hint and a label; `tx_sender_module` takes this
+          list as one bundle, and the keystore asks the human once for both.
+        run: "./logos/bin/logoscore call uniswap_module build_swap 31337 @swap.json"
+        code_block: "logoscore call uniswap_module build_swap 31337 @swap.json"
+        expect_contains:
+          - '"calls":['
+          - '"kind":"approve"'
+          - '"label":"Approve USDC for Uniswap"'
+          - '"kind":"swap"'
+          - '"label":"Swap USDC for ETH on Uniswap V2"'
+          - '"data":"0x18cbafe5'
+          - '"amountOutMin":"331611398100316613"'
+          - '"slippageBps":50'
+          - '"gasLimitHint":180000'
+      - title: "An amount that is not a number is refused, not read as zero"
+        run: "./logos/bin/logoscore call uniswap_module quote_swap 31337 '{\"tokenIn\":\"ETH\",\"tokenOut\":\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\",\"amountIn\":\"ten\"}' || true"
+        code_block: "logoscore call uniswap_module quote_swap 31337 '{\"tokenIn\":\"ETH\",\"tokenOut\":\"0xA0b8…eB48\",\"amountIn\":\"ten\"}'"
+        expect_contains:
+          - "not an amount"
+
+  - title: "Stop everything"
+    step: true
+    steps:
       - title: "Stop the daemon and the mock node"
         run: |
           trap '' TERM
@@ -242,7 +365,7 @@ sections:
         expect_contains:
           - '"status":"not_running"'
         post_text: |
-          The reported $3000 WETH price is computed entirely from the mock's
-          reserves, decoded in-process — proof that the full path (Multicall3
-          batch → `eth_rpc_module` → node → reserve maths → USD anchoring) runs
-          end-to-end through the live module.
+          The reported $3000 WETH price and the 0.3333 ETH quote are computed
+          entirely from the mock's reserves, decoded in-process — proof that the
+          full path (Multicall3 batch → `eth_rpc_module` → node → reserve and
+          quote maths → the swap's calls) runs end-to-end through the live module.
