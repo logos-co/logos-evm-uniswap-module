@@ -321,17 +321,19 @@ sections:
           which is zero, so `needsApproval` is `true`.
         run: "./logos/bin/logoscore call uniswap_module quote_swap 31337 @swap.json"
         code_block: "logoscore call uniswap_module quote_swap 31337 @swap.json"
+        # `logoscore call` prints the module's reply as an escaped JSON string, so the
+        # quotes inside it are backslashed here.
         expect_contains:
-          - '"amountOut":"333277787035494084"'
-          - '"version":"V2"'
-          - '"viaWeth":false'
-          - '"feeBps":30'
-          - '"priceImpactBps":2'
-          - '"balanceIn":"5000000000000"'
-          - '"allowance":"0"'
-          - '"needsApproval":true'
-          - '"approval":"set"'
-          - '"spender":"0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"'
+          - '\"amountOut\":\"333277787035494084\"'
+          - '\"version\":\"V2\"'
+          - '\"viaWeth\":false'
+          - '\"feeBps\":30'
+          - '\"priceImpactBps\":2'
+          - '\"balanceIn\":\"5000000000000\"'
+          - '\"allowance\":\"0\"'
+          - '\"needsApproval\":true'
+          - '\"approval\":\"set\"'
+          - '\"spender\":\"0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D\"'
       - title: "Build the swap"
         text: |
           The same quote, plus the calls that make it, **in the order they must
@@ -342,15 +344,15 @@ sections:
         run: "./logos/bin/logoscore call uniswap_module build_swap 31337 @swap.json"
         code_block: "logoscore call uniswap_module build_swap 31337 @swap.json"
         expect_contains:
-          - '"calls":['
-          - '"kind":"approve"'
-          - '"label":"Approve USDC for Uniswap"'
-          - '"kind":"swap"'
-          - '"label":"Swap USDC for ETH on Uniswap V2"'
-          - '"data":"0x18cbafe5'
-          - '"amountOutMin":"331611398100316613"'
-          - '"slippageBps":50'
-          - '"gasLimitHint":180000'
+          - '\"calls\":['
+          - '\"kind\":\"approve\"'
+          - '\"label\":\"Approve USDC for Uniswap\"'
+          - '\"kind\":\"swap\"'
+          - '\"label\":\"Swap USDC for ETH on Uniswap V2\"'
+          - '\"data\":\"0x18cbafe5'
+          - '\"amountOutMin\":\"331611398100316613\"'
+          - '\"slippageBps\":50'
+          - '\"gasLimitHint\":180000'
       - title: "An amount that is not a number is refused, not read as zero"
         run: "./logos/bin/logoscore call uniswap_module quote_swap 31337 '{\"tokenIn\":\"ETH\",\"tokenOut\":\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\",\"amountIn\":\"ten\"}' || true"
         code_block: "logoscore call uniswap_module quote_swap 31337 '{\"tokenIn\":\"ETH\",\"tokenOut\":\"0xA0b8…eB48\",\"amountIn\":\"ten\"}'"
