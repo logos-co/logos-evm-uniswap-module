@@ -1,6 +1,6 @@
 # `logos-evm-uniswap-module` — Specification & Reference
 
-> Uniswap **price oracle and swap router** for the Logos multi-chain EVM wallet.
+> Uniswap **price oracle and swap quoter/encoder** for the Logos multi-chain EVM wallet.
 > Derives Uniswap V2/V3/V4 pool addresses **offline** (CREATE2), bundles every
 > on-chain read into a **single Multicall3 `eth_call`** issued through
 > `eth_rpc_module`, and returns best-rate token→ETH / token→USD prices plus
@@ -37,7 +37,7 @@ logos-evm-wallet-ui                (universal C++ ui_qml app; Market tab)
 logos-evm-wallet-backend-module    (coordinator; calls get_prices / quote_swap /
         │                           build_swap for its Market tab + send pipeline)
         ▼
-logos-evm-uniswap-module  ◀── THIS REPO  (price oracle + swap router)
+logos-evm-uniswap-module  ◀── THIS REPO  (price oracle + swap quoter)
         │  module→module: modules().eth_rpc_module.call(chainId, callJson)
         ▼
 logos-evm-eth-rpc-module           (multi-chain JSON-RPC transport, fail-closed)
@@ -304,25 +304,51 @@ logoscore call uniswap_module get_prices 31337 @tokens.json
 fn quote_swap(&self, chain_id: i64, params_json: String) -> String
 ```
 
-Return the **best output** for `amountIn` of `tokenIn → tokenOut`, scanning V2
-(if a router is configured) and **every configured V3 fee tier**. The route with
-the largest output wins. (V4 swaps/quotes are a fast-follow — pricing supports V4
-but `quote_swap`/`build_swap` do not yet route through it.)
+The **best route** for `amountIn` of `tokenIn → tokenOut`, in **one Multicall3 round
+trip**. Candidates: V2 direct, V2 via WETH, V3 direct on every configured fee tier, and V3
+via WETH on every pair of tiers (22 routes on a chain with both versions and four tiers).
+Beside every candidate rides a **probe** quote of a thousandth of the amount; the winning
+route's probe gives the marginal rate, and the shortfall of the real rate against it is the
+**price impact**. With an `owner`, the same batch reads that account's balance of the input
+token and its allowance for each router, so the reply also says whether the swap can be
+paid for and whether an approval must go first.
 
 | Param | Type | Meaning |
 |---|---|---|
 | `chain_id` | `i64` | Chain to quote on |
-| `params_json` | `String` ([`SwapReq`](#52-swapreq)) | Uses `tokenIn`, `tokenOut`, `amountIn`; other fields ignored here |
+| `params_json` | `String` ([`SwapReq`](#52-swapreq)) | `tokenIn`, `tokenOut`, `amountIn`; `owner` optional |
 
-`amountIn` parses as decimal or `0x`-hex (`parse_u256`; invalid → `0`).
+`amountIn` is decimal digits or `0x`-hex, in base units. Anything else — including `0` —
+is **refused** (`"not an amount"`, `"amount must be greater than zero"`), never read as zero.
 
-- **Success:** `{ "ok": true, "version": "V2"|"V3", "fee": <u32>, "amountOut": "<decimal string>" }`
-  (`fee` is `0` for V2; a tier like `500`/`3000` for V3).
-- **Error:** `{ "ok": false, "error": "no route found" }` (or parse/chain error).
+- **Success:**
+
+  ```json
+  { "ok": true, "chainId": 1,
+    "tokenIn": "0xA0b8…eB48", "tokenOut": "ETH",
+    "amountIn": "1000000000", "amountOut": "333277787035494084",
+    "route": { "version": "V3", "viaWeth": false,
+               "hops": [ { "tokenIn": "0xA0b8…eB48", "tokenOut": "0xC02a…6Cc2", "fee": 500 } ] },
+    "feeBps": 5, "priceImpactBps": 2, "gasLimitHint": 235000,
+    "spender": "0x68b3…Fc45",
+    "balanceIn": "5000000000000", "allowance": "0",
+    "needsApproval": true, "approval": "set",
+    "rpcRoute": "direct" }
+  ```
+
+  `route.hops` names the ERC-20 legs (WETH stands in for ether). `feeBps` is the pool fee
+  summed over the hops (V2: 30 per hop). `priceImpactBps` is `null` when the probe did not
+  answer. `gasLimitHint` is a gas limit for the swap leg, generous on purpose (see 6.5).
+  `balanceIn`, `allowance`, `needsApproval` and `approval` are `null` without an `owner`;
+  `approval` is `none`, `set` (approve exactly `amountIn`) or `resetThenSet` (a non-zero
+  allowance too small for the amount is zeroed first — USDT refuses the direct change).
+  `rpcRoute` is eth_rpc's own label for how the read was served.
+- **Error:** `{ "ok": false, "error": "no route found" }` when no candidate answered, or a
+  parse/chain error.
 
 ```bash
-# 1000 USDC → WETH, best of V2 + V3 tiers
-logoscore call uniswap_module quote_swap 1 '{"tokenIn":"0xA0b8…eB48","tokenOut":"ETH","amountIn":"1000000000"}'
+# 1000 USDC → ETH for an account, best of V2 + V3 tiers, direct or via WETH
+logoscore call uniswap_module quote_swap 1 '{"tokenIn":"0xA0b8…eB48","tokenOut":"ETH","amountIn":"1000000000","owner":"0xf39F…2266"}'
 ```
 
 ---
@@ -333,64 +359,46 @@ logoscore call uniswap_module quote_swap 1 '{"tokenIn":"0xA0b8…eB48","tokenOut
 fn build_swap(&self, chain_id: i64, params_json: String) -> String
 ```
 
-Quote the best route (same selection as `quote_swap`) and **ABI-encode the
-unsigned swap** for it: the router address, the `value` (ETH for native input),
-the router calldata, the slippage floor, and — for ERC20 inputs — the
-prerequisite `approve` calldata. The backend wraps nonce/fee/gas around the
-returned `(router, value, data)` and signs/broadcasts.
+The quote (same selection as `quote_swap`) plus the **calls that make the swap, in the
+order they must land**, in the shape `tx_sender_module` takes. The module holds no key and
+sends nothing; the consumer hands `calls` to the sender, which asks the keystore for one
+approval over all of them.
 
 | Field in `params_json` ([`SwapReq`](#52-swapreq)) | Type | Meaning / default |
 |---|---|---|
-| `tokenIn` | string | input token (`"ETH"` = native) — **required** |
-| `tokenOut` | string | output token (`"ETH"` = native) — **required** |
-| `amountIn` | string | input amount (decimal or `0x`-hex) — **required** |
-| `recipient` | string (addr) | swap recipient — **required** (else `"recipient required"`) |
-| `amountOutMin` | string | explicit slippage floor; if empty, derived from quote |
-| `slippageBps` | u64 | basis points off the quote when `amountOutMin` empty; default `50` (0.5%) |
-| `deadline` | u64 | unix deadline; if `0`, defaults to `now + 1200s` |
+| `tokenIn`, `tokenOut` | string | `"ETH"` = native — **required** |
+| `amountIn` | string | base units, decimal or `0x`-hex — **required** |
+| `owner` | string (addr) | the account that pays — **required** (`"owner required"`) |
+| `recipient` | string (addr) | who receives; defaults to `owner` |
+| `slippageBps` | u64 | default `50`; above `5000` refused |
+| `amountOutMin` | string | overrides the slippage floor |
+| `deadline` | u64 | unix seconds; default now + 30 min |
+| `symbolIn`, `symbolOut` | string | only name the calls' labels |
 
-**Slippage math:** when `amountOutMin` is empty,
-`amountOutMin = quote.amountOut * (10000 - slippageBps) / 10000`
-(saturating; `slippageBps ≥ 10000` floors to 0).
+- **Success:** every field of `quote_swap`, plus
 
-**Success shape:**
+  ```json
+  { "owner": "0xf39F…2266", "recipient": "0xf39F…2266",
+    "amountOutMin": "331611398100316613", "slippageBps": 50, "deadline": 1789200000,
+    "calls": [
+      { "kind": "approve", "to": "0xA0b8…eB48", "value": "0x0", "data": "0x095ea7b3…",
+        "gasLimitHint": 60000, "label": "Approve USDC for Uniswap" },
+      { "kind": "swap", "to": "0x68b3…Fc45", "value": "0x0", "data": "0x5ae401dc…",
+        "gasLimitHint": 235000, "label": "Swap USDC for ETH on Uniswap V3" } ] }
+  ```
 
-```json
-{
-  "ok": true,
-  "version": "V3",
-  "fee": 500,
-  "router": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
-  "value": "0x0",
-  "data": "0x414bf389…",
-  "amountOut": "1234567890",
-  "amountOutMin": "1228395050",
-  "approve": {
-    "token": "0xA0b8…eB48",
-    "spender": "0xE592…1564",
-    "data": "0x095ea7b3…"
-  }
-}
-```
-
-- `value` is `0x<amountIn>` when **input is native ETH**, else `0x0`.
-- `approve` is `null` when the input is native ETH (no allowance needed); for
-  ERC20 input it carries the ERC20 `approve(router, amountIn)` calldata that must
-  land **before** the swap.
-- Routing by version:
-  - **V2:** native-in → `swapExactETHForTokens`; native-out → `swapExactTokensForETH`;
-    else `swapExactTokensForTokens` (path `[in, out]` with WETH substituted for native).
-  - **V3:** `exactInputSingle(ExactInputSingleParams{…, sqrtPriceLimitX96:0})`.
-- **Error:** `{ "ok": false, "error": "could not build swap for the best route (V4 swaps are a fast-follow)" }`
-  when the winning route is V4, or the usual parse/quote/chain errors.
-
-> **Native output caveat (from source):** V3 native **output** delivers WETH to
-> the recipient (no unwrap yet); native-ETH unwrap and V4 swaps are flagged
-> fast-follows in `swap.rs`.
-
-```bash
-logoscore call uniswap_module build_swap 1 @swap_params.json
-```
+  An ether input needs no approval and rides as the swap's `value`. A `resetThenSet`
+  approval is two `approve` calls (`0`, then the amount). Approvals are for **exactly the
+  amount**: no infinite allowances.
+- **Encoding.** V2 routes call the legacy V2 router (`swapExactETHForTokens`,
+  `swapExactTokensForETH`, `swapExactTokensForTokens`, deadline inline). V3 routes call
+  **SwapRouter02** through `multicall(deadline, bytes[])`, which is where the deadline is
+  checked: `exactInputSingle` for one hop, `exactInput` with the packed path
+  (`token | fee | token | …`) for two. An ether **output** on V3 is swapped to the router
+  itself (`address(2)`) and `unwrapWETH9(amountOutMin, recipient)` in the same multicall
+  pays the recipient in ether.
+- **Error:** as `quote_swap`, or `"could not build the swap for the best route"` when the
+  chain has no router for the winning version.
 
 ---
 
@@ -413,7 +421,7 @@ optional field left `None` disables that version's pricing/swaps on that chain.
 | `v3Factory` | string? | — | Enables V3 pricing |
 | `v3InitCodeHash` | string? | — | V3 pool init-code hash |
 | `v3Quoter` | string? | — | QuoterV2 for V3 quotes/swaps |
-| `v3Router` | string? | — | SwapRouter for V3 swaps |
+| `v3Router` | string? | — | **SwapRouter02** — V3 swaps go through its `multicall(deadline, …)` |
 | `v3FeeTiers` | `u32[]` | default `[100,500,3000,10000]` | Fee tiers probed for V3 pools |
 | `v4StateView` | string? | — | Enables V4 pricing (`getSlot0`/`getLiquidity`) |
 | `v4Quoter` | string? | — | V4 quoter (reserved; V4 swaps fast-follow) |
@@ -421,25 +429,33 @@ optional field left `None` disables that version's pricing/swaps on that chain.
 
 ### 5.2 `SwapReq`
 
-`quote_swap` / `build_swap` params (camelCase, `glue.rs`):
-`tokenIn`, `tokenOut`, `amountIn` (required); `amountOutMin` (default `""`),
-`recipient` (default `""`), `deadline` (default `0` → now+1200s),
-`slippageBps` (default `50`).
+```json
+{ "tokenIn": "ETH" | "<addr>", "tokenOut": "ETH" | "<addr>", "amountIn": "<base units>",
+  "owner": "<addr>", "recipient": "<addr>", "slippageBps": 50, "amountOutMin": "<base units>",
+  "deadline": <unix secs>, "symbolIn": "USDC", "symbolOut": "ETH" }
+```
+
+Native ether is `"ETH"`, `"native"`, `""` or `0x0…0`. Everything but the first three
+fields is optional; `owner` is required by `build_swap`. Every amount is base units.
 
 ### 5.3 Seeded default chains (`default_chains()`)
 
-Shipped out of the box; overridable via `configure`.
+| Chain | V2 | V3 | V4 pricing |
+|---|---|---|---|
+| Ethereum (1) | factory, Router02, init hash | factory, QuoterV2, **SwapRouter02** `0x68b3…Fc45` | StateView + Quoter |
+| Sepolia (11155111) | factory `0xF62c…80E6`, Router02 `0xeE56…CfE3`, init hash | factory `0x0227…AC1c`, QuoterV2 `0xEd1f…2FB3`, SwapRouter02 `0x3bFA…e48E` | — |
+| Optimism (10) | — | QuoterV2, SwapRouter02 `0x68b3…Fc45` | — |
+| Arbitrum One (42161) | — | QuoterV2, SwapRouter02 `0x68b3…Fc45` | — |
+| Base (8453) | — | factory `0x3312…FDfD`, QuoterV2 `0x3d4e…B76a`, SwapRouter02 `0x2626…e481` | — |
 
-| Chain | id | V2 | V3 | V4 | Stablecoins |
-|---|---|---|---|---|---|
-| Ethereum | 1 | ✅ (factory + router + init hash) | ✅ (canonical factory `0x1F98…F984`, QuoterV2, SwapRouter) | ✅ (StateView + Quoter) | USDC, USDT |
-| Optimism | 10 | — | ✅ (canonical factory + quoter/router) | — | USDC, USDT |
-| Arbitrum One | 42161 | — | ✅ | — | USDC, USDT |
-| Base | 8453 | — | ✅ (**different** factory `0x3312…FDfD` + quoter/router) | — | USDC |
+Stablecoins: USDC (+ USDT where deployed); Sepolia uses Circle's USDC
+`0x1c7D…7238`. Multicall3 is the canonical `0xcA11…CA11` everywhere. The canonical V2 and
+V3 init-code hashes derive Sepolia's real pairs and pools (the config tests pin the
+USDC/WETH pair and the 0.05% pool read off the chain).
 
-Canonical constants in `config.rs`: V2 init hash
-`0x96e8ac42…348845f`, V3 init hash `0xe34f199b…87b8b54`, V3 factory
-`0x1F98431c…31F984`, Multicall3 `0xcA11bde0…3976CA11`.
+**`v3Router` is SwapRouter02 on every chain.** The encoder wraps V3 swaps in its
+`multicall(deadline, …)`, which the legacy SwapRouter (`0xE592…1564`) does not have; a
+chain configured with the legacy router reverts every V3 swap.
 
 ### 5.4 Persisted state
 
@@ -516,20 +532,33 @@ omitted entirely (prices come back with `usd: null`).
 2,000 WETH (18 dec) → `eth_per_usdc = 1/3000`; with USDC the stablecoin,
 `WETH usd = 1 / (1/3000) = $3000`, `USDC usd = $1`.
 
-### 6.5 Swap quoting (`swap.rs`)
+### 6.5 Swap quoting and encoding (`swap.rs`)
 
-`quote_swap`/`build_swap` build a **quote** batch (not a pool-read batch):
-
-- **V2:** `IUniswapV2Router.getAmountsOut(amountIn, [in, out])` → decode the last
-  hop (`decode_amounts_out`).
-- **V3:** `IQuoterV2.quoteExactInputSingle(QuoteExactInputSingleParams{…})` for
-  each fee tier → decode `amountOut` (first return word, `decode_v3_quote`).
-
-`decode_best_quote` zips results with their kinds and returns the route with the
-**largest non-zero output** (`BestQuote{version, fee, amount_out}`). Reverted
-calls (`None`) and zero outputs are skipped.
-
----
+- **Candidates.** `candidate_routes` enumerates V2 direct, V2 via WETH, V3 direct per fee
+  tier, V3 via WETH per tier pair — 22 on a full chain. Nothing goes "via WETH" when one
+  side already is WETH, and ether against WETH is a wrap, not a swap (no routes).
+- **The batch.** `build_quote_batch` emits, per route, the quote and its probe
+  (`probe_amount` = `amountIn / 1000`, at least 1): V2 `getAmountsOut(path)`, V3
+  `QuoterV2.quoteExactInputSingle` or `quoteExactInput(path)`. With an owner it appends
+  `balanceOf(owner)` (or Multicall3 `getEthBalance`) and, via `with_allowance_read`, one
+  `allowance(owner, router)` per router the chain has — the winner's router is not known
+  until the quotes are back.
+- **Decoding.** `decode_quotes` reads every route that answered non-zero (a reverted call
+  is a pool that does not exist) and QuoterV2's `gasEstimate`, which is word 3 in both
+  return shapes. `pick_best` takes the largest output; between equals, the fewer hops.
+- **Price impact.** `price_impact_bps = 10000 × (1 − (amountOut/amountIn) / (probeOut/probeIn))`
+  in integer arithmetic, clamped at 0, `None` without a probe answer. The probe pays the
+  same pool fees, so the figure is the amount's own weight, fee excluded.
+- **Gas hints.** V3: the quoter's estimate + 25% + 70k router overhead (+30k wrapping ether
+  in, +40k unwrapping it out); 150k per hop when the quoter gave none. V2: 180k single,
+  260k two-hop. Approve: 60k. A limit too low burns the fee and swaps nothing, so these
+  err high; the sender estimates the legs it can, and takes the hint where it cannot
+  (a swap leg behind an approval reverts under `eth_estimateGas` until that lands).
+- **Approvals.** `approval_needed`: ether → none; allowance ≥ amount → none; zero or unread
+  → approve the amount; non-zero and short → zero it, then approve the amount.
+- **Encoding.** See 4.5. Selectors: V2 `getAmountsOut 0xd06ca61f`; SwapRouter02
+  `exactInputSingle 0x04e45aaf`, `exactInput 0xb858183f`, `unwrapWETH9 0x49404b7c`,
+  `multicall(uint256,bytes[]) 0x5ae401dc`; QuoterV2 `quoteExactInput 0xcdca1753`.
 
 ## 7. Build, run & test
 

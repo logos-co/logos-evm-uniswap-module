@@ -1,31 +1,22 @@
-//! Logos module glue for `uniswap_module` (rust-first authoring).
+//! Logos module glue for `uniswap_module`: the wallet's price oracle and swap quoter/encoder,
+//! reached through `eth_rpc_module` alone. It holds no key and sends nothing; a consumer
+//! hands the calls it builds to `tx_sender_module`. Compiled only with the `logos_module`
+//! feature; the pure cores are tested with `cargo test --no-default-features`.
 //!
-//! Depends on `eth_rpc_module` (declared in metadata.json `dependencies`),
-//! reached as `modules().eth_rpc_module.call(chainId, callJson, deadlineMs)`. This module is
-//! the wallet's **price oracle and swap router**: it derives pool addresses
-//! offline, bundles every read into one Multicall3 `eth_call`, and returns
-//! token→ETH / token→USD prices and best-rate swap quotes/transactions.
-//!
-//! Compiled only with the default `logos_module` feature; the pure cores
-//! (`config`, `pricing`, `swap`) are tested with `cargo test --no-default-features`.
-//!
-//! `concurrency: "multi"` (metadata.json): every price/quote/swap method blocks on
-//! a Multicall3 `eth_call` through eth_rpc, so the module opts into concurrent
-//! dispatch — pricing several chains at once no longer serializes. The multi
-//! contract makes the generated trait take `&self` + `Send + Sync`; the config map
-//! lives behind a `RwLock` (read it, clone the chain, drop the lock, then call —
-//! `configure` is the only writer).
+//! `concurrency: "multi"`: every method blocks on a Multicall3 `eth_call`, so dispatch is
+//! concurrent. The config map lives behind a `RwLock` — read it, clone the chain, drop the
+//! lock, then call. `configure` is the only writer.
 
 use std::sync::RwLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::{ChainUniswap, ConfigStore, STABLE_DECIMALS};
-use crate::pricing::{self, parse_addr as parse_addr_opt};
-use crate::swap;
+use crate::pricing::{self, parse_addr as parse_addr_opt, Version};
+use crate::swap::{self, Approval, CallKind, Quoted};
 
 pub trait UniswapModule: Send + Sync + 'static {
     /// Add or override a chain's Uniswap config (JSON of `ChainUniswap`).
@@ -35,9 +26,12 @@ pub trait UniswapModule: Send + Sync + 'static {
     /// Token→ETH and token→USD prices for `{ "tokens": [{address, decimals}] }`,
     /// best-rate across V2/V3/V4, batched into one Multicall3 `eth_call`.
     fn get_prices(&self, chain_id: i64, tokens_json: String) -> String;
-    /// Best swap quote for `{ tokenIn, tokenOut, amountIn }` (native = "ETH").
+    /// Best swap quote for `{ tokenIn, tokenOut, amountIn, owner? }` (native = "ETH"):
+    /// the route, its output, the price impact, a gas hint, and — with `owner` — the
+    /// account's balance and whether an approval must go first.
     fn quote_swap(&self, chain_id: i64, params_json: String) -> String;
-    /// Unsigned swap tx (router, value, data, +approval) for the best route.
+    /// The quote plus the calls that make the swap, in order, in the shape
+    /// `tx_sender_module` takes: `{ calls: [{ kind, to, value, data, gasLimitHint, label }] }`.
     fn build_swap(&self, chain_id: i64, params_json: String) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
@@ -52,6 +46,15 @@ struct UniswapModuleImpl {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// One Multicall3 read through eth_rpc. A quote batch is tens of quoter calls, which a
+/// public node answers in a second or two; the verified proxy adds a proof round trip.
+const RPC_BUDGET: Duration = Duration::from_millis(15_000);
+
+/// The deadline handed to eth_rpc: the budget less the margin the transport itself needs.
+fn callee_deadline(t: Duration) -> Option<i64> {
+    t.checked_sub(Duration::from_millis(300)).map(|d| d.as_millis() as i64)
+}
+
 fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
 }
@@ -63,15 +66,6 @@ fn parse_token(s: &str) -> Result<Address, String> {
         return Ok(Address::ZERO);
     }
     parse_addr_opt(t).ok_or_else(|| format!("invalid address: {s}"))
-}
-
-fn parse_u256(s: &str) -> U256 {
-    let t = s.trim();
-    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        U256::from_str_radix(h, 16).unwrap_or(U256::ZERO)
-    } else {
-        t.parse().unwrap_or(U256::ZERO)
-    }
 }
 
 fn now_secs() -> u64 {
@@ -94,6 +88,8 @@ struct PricesReq {
     tokens: Vec<TokenIn>,
 }
 
+/// A swap request. `owner` is the account that pays and, unless `recipient` says otherwise,
+/// receives; `symbolIn`/`symbolOut` only name the calls the sender records.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SwapReq {
@@ -101,16 +97,95 @@ struct SwapReq {
     token_out: String,
     amount_in: String,
     #[serde(default)]
-    amount_out_min: String,
+    owner: String,
     #[serde(default)]
     recipient: String,
+    #[serde(default)]
+    amount_out_min: String,
     #[serde(default)]
     deadline: u64,
     #[serde(default = "default_slippage_bps")]
     slippage_bps: u64,
+    #[serde(default)]
+    symbol_in: String,
+    #[serde(default)]
+    symbol_out: String,
 }
 fn default_slippage_bps() -> u64 {
     50 // 0.5%
+}
+
+const MAX_SLIPPAGE_BPS: u64 = 5_000;
+
+/// The parsed half of a request, shared by the two swap methods.
+struct Parsed {
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    owner: Option<Address>,
+}
+
+fn parse_swap(p: &SwapReq) -> Result<Parsed, String> {
+    let token_in = parse_token(&p.token_in)?;
+    let token_out = parse_token(&p.token_out)?;
+    let amount_in = swap::parse_amount(&p.amount_in)?;
+    let owner = if p.owner.trim().is_empty() {
+        None
+    } else {
+        Some(parse_addr_opt(p.owner.trim()).ok_or_else(|| format!("invalid owner: {}", p.owner))?)
+    };
+    if p.slippage_bps > MAX_SLIPPAGE_BPS {
+        return Err(format!("slippage above {MAX_SLIPPAGE_BPS} bps is refused"));
+    }
+    Ok(Parsed { token_in, token_out, amount_in, owner })
+}
+
+/// Everything one quote round trip learned.
+struct QuoteOutcome {
+    chain: ChainUniswap,
+    best: Quoted,
+    impact_bps: Option<u32>,
+    owner: swap::OwnerState,
+    /// The router the winning route swaps on.
+    spender: Address,
+    /// eth_rpc's own label for how the read was served (`direct`, `verified`, …).
+    rpc_route: Option<String>,
+}
+
+fn short(a: Address) -> String {
+    let s = format!("{a}");
+    format!("{}…{}", &s[..6], &s[s.len() - 4..])
+}
+
+fn name_of(sym: &str, token: Address) -> String {
+    if !sym.trim().is_empty() {
+        sym.trim().to_string()
+    } else if swap::is_native(token) {
+        "ETH".to_string()
+    } else {
+        short(token)
+    }
+}
+
+fn route_json(q: &Quoted) -> Value {
+    let hops: Vec<Value> = q
+        .route
+        .tokens
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| {
+            let mut h = json!({ "tokenIn": format!("{}", w[0]), "tokenOut": format!("{}", w[1]) });
+            if let Some(fee) = q.route.fees.get(i) {
+                h["fee"] = json!(fee);
+            }
+            h
+        })
+        .collect();
+    json!({
+        "version": format!("{:?}", q.route.version),
+        "hops": hops,
+        "viaWeth": q.route.via_weth(),
+    })
 }
 
 impl UniswapModuleImpl {
@@ -140,30 +215,88 @@ impl UniswapModuleImpl {
         }
     }
 
-    /// Issue `aggregate3(calls)` through eth_rpc and return per-call results.
-    /// Touches no module state, so no lock is held across the blocking call.
-    fn run_multicall(&self, chain_id: i64, multicall3: &str, calls: &[(Address, Vec<u8>)]) -> Result<Vec<Option<Vec<u8>>>, String> {
+    /// Issue `aggregate3(calls)` through eth_rpc and return per-call results plus the
+    /// route eth_rpc served it by. Touches no module state, so no lock is held across
+    /// the blocking call.
+    fn run_multicall(
+        &self,
+        chain_id: i64,
+        multicall3: &str,
+        calls: &[(Address, Vec<u8>)],
+    ) -> Result<(Vec<Option<Vec<u8>>>, Option<String>), String> {
         if calls.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let data = pricing::multicall3_aggregate3_calldata(calls);
         let call_json = json!({ "to": multicall3, "data": format!("0x{}", hex::encode(data)) }).to_string();
-        let resp = modules().eth_rpc_module.call(chain_id, &call_json, None).map_err(|e| e.to_string())?;
+        let resp = modules()
+            .eth_rpc_module
+            .call_with_timeout(chain_id, &call_json, callee_deadline(RPC_BUDGET), RPC_BUDGET)
+            .map_err(|e| format!("{e:?}"))?;
         let v: Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
         if v.get("ok").and_then(Value::as_bool) == Some(false) {
             return Err(v.get("error").and_then(Value::as_str).unwrap_or("eth_call failed").to_string());
         }
         let result_hex = v.get("result").and_then(Value::as_str).ok_or("multicall: no result")?;
         let bytes = hex::decode(result_hex.trim_start_matches("0x")).map_err(|e| e.to_string())?;
-        pricing::decode_aggregate3_returns(&bytes).ok_or_else(|| "multicall: decode failed".to_string())
+        let route = v.get("route").and_then(Value::as_str).map(str::to_string);
+        let results = pricing::decode_aggregate3_returns(&bytes).ok_or_else(|| "multicall: decode failed".to_string())?;
+        Ok((results, route))
     }
 
-    /// Quote `amount_in` of `token_in → token_out` across V2 + V3 fee tiers.
-    fn quote(&self, chain_id: i64, token_in: Address, token_out: Address, amount_in: U256) -> Result<swap::BestQuote, String> {
+    /// One round trip: every candidate route quoted for the amount and for its probe, plus
+    /// the owner's balance and allowances when an owner was named.
+    fn quote(&self, chain_id: i64, p: &Parsed) -> Result<QuoteOutcome, String> {
         let chain = self.chain_cfg(chain_id)?;
-        let batch = swap::build_quote_batch(&chain, token_in, token_out, amount_in);
-        let results = self.run_multicall(chain_id, &chain.multicall3, &batch.calls)?;
-        swap::decode_best_quote(&batch, &results).ok_or_else(|| "no route found".to_string())
+        let mut batch = swap::build_quote_batch(&chain, p.token_in, p.token_out, p.amount_in, p.owner);
+        if batch.calls.is_empty() {
+            return Err("no route: the pair has no pool this module can quote".to_string());
+        }
+        if let Some(owner) = p.owner {
+            for v in [Version::V3, Version::V2] {
+                if let Some(router) = swap::router_for(&chain, v) {
+                    batch = swap::with_allowance_read(batch, p.token_in, owner, router);
+                }
+            }
+        }
+        let (results, rpc_route) = self.run_multicall(chain_id, &chain.multicall3, &batch.calls)?;
+        let (quotes, owner) = swap::decode_quotes(&batch, &results);
+        let best = swap::pick_best(&quotes).cloned().ok_or_else(|| "no route found".to_string())?;
+        let spender = swap::router_for(&chain, best.route.version).ok_or("no router for the winning route")?;
+        let impact_bps = best
+            .probe_out
+            .and_then(|po| swap::price_impact_bps(p.amount_in, best.amount_out, batch.probe_in(), po));
+        Ok(QuoteOutcome { chain, best, impact_bps, owner, spender, rpc_route })
+    }
+
+    fn quote_json(&self, chain_id: i64, req: &SwapReq, p: &Parsed, o: &QuoteOutcome) -> Value {
+        let native_in = swap::is_native(p.token_in);
+        let approval = p.owner.map(|_| swap::approval_needed(native_in, o.owner.allowance_for(o.spender), p.amount_in));
+        let mut v = json!({
+            "ok": true,
+            "chainId": chain_id,
+            "tokenIn": req.token_in,
+            "tokenOut": req.token_out,
+            "amountIn": p.amount_in.to_string(),
+            "amountOut": o.best.amount_out.to_string(),
+            "route": route_json(&o.best),
+            "feeBps": o.best.route.fee_bps(),
+            "priceImpactBps": o.impact_bps,
+            "gasLimitHint": swap::gas_hint(&o.best, native_in, swap::is_native(p.token_out)),
+            "spender": format!("{}", o.spender),
+            "balanceIn": o.owner.balance_in.map(|b| b.to_string()),
+            "allowance": o.owner.allowance_for(o.spender).map(|a| a.to_string()),
+            "needsApproval": approval.map(|a| a != Approval::None),
+            "approval": approval.map(|a| match a {
+                Approval::None => "none",
+                Approval::Set(_) => "set",
+                Approval::ResetThenSet(_) => "resetThenSet",
+            }),
+        });
+        if let Some(r) = &o.rpc_route {
+            v["rpcRoute"] = json!(r);
+        }
+        v
     }
 }
 
@@ -224,7 +357,7 @@ impl UniswapModule for UniswapModuleImpl {
             (chain.multicall3.clone(), weth, stable_addrs, pricing::build_pricing_batch(&chain, weth, &priced))
         };
 
-        let results = match self.run_multicall(chain_id, &mc, &batch.calls) {
+        let (results, _) = match self.run_multicall(chain_id, &mc, &batch.calls) {
             Ok(r) => r,
             Err(e) => return err(e),
         };
@@ -251,82 +384,103 @@ impl UniswapModule for UniswapModuleImpl {
     }
 
     fn quote_swap(&self, chain_id: i64, params_json: String) -> String {
-        let p: SwapReq = match serde_json::from_str(&params_json) {
+        let req: SwapReq = match serde_json::from_str(&params_json) {
             Ok(p) => p,
             Err(e) => return err(e),
         };
-        let (token_in, token_out) = match (parse_token(&p.token_in), parse_token(&p.token_out)) {
-            (Ok(i), Ok(o)) => (i, o),
-            (Err(e), _) | (_, Err(e)) => return err(e),
+        let p = match parse_swap(&req) {
+            Ok(p) => p,
+            Err(e) => return err(e),
         };
-        match self.quote(chain_id, token_in, token_out, parse_u256(&p.amount_in)) {
-            Ok(q) => json!({
-                "ok": true,
-                "version": format!("{:?}", q.version),
-                "fee": q.fee,
-                "amountOut": q.amount_out.to_string(),
-            })
-            .to_string(),
+        match self.quote(chain_id, &p) {
+            Ok(o) => self.quote_json(chain_id, &req, &p, &o).to_string(),
             Err(e) => err(e),
         }
     }
 
     fn build_swap(&self, chain_id: i64, params_json: String) -> String {
-        let p: SwapReq = match serde_json::from_str(&params_json) {
+        let req: SwapReq = match serde_json::from_str(&params_json) {
             Ok(p) => p,
             Err(e) => return err(e),
         };
-        let (token_in, token_out) = match (parse_token(&p.token_in), parse_token(&p.token_out)) {
-            (Ok(i), Ok(o)) => (i, o),
-            (Err(e), _) | (_, Err(e)) => return err(e),
+        let p = match parse_swap(&req) {
+            Ok(p) => p,
+            Err(e) => return err(e),
         };
-        let amount_in = parse_u256(&p.amount_in);
-        let recipient = match parse_addr_opt(&p.recipient) {
-            Some(r) => r,
-            None => return err("recipient required"),
+        // The payer is the owner; the recipient defaults to the payer. Without an owner
+        // there is no allowance to read and no account to build the swap for.
+        let Some(owner) = p.owner else {
+            return err("owner required");
+        };
+        let recipient = if req.recipient.trim().is_empty() {
+            owner
+        } else {
+            match parse_addr_opt(req.recipient.trim()) {
+                Some(r) => r,
+                None => return err(format!("invalid recipient: {}", req.recipient)),
+            }
         };
 
-        let quote = match self.quote(chain_id, token_in, token_out, amount_in) {
-            Ok(q) => q,
+        let o = match self.quote(chain_id, &p) {
+            Ok(o) => o,
             Err(e) => return err(e),
         };
 
         // amountOutMin: explicit if given, else quote minus slippage.
-        let amount_out_min = if p.amount_out_min.is_empty() {
-            let bps = U256::from(10_000u64.saturating_sub(p.slippage_bps));
-            quote.amount_out.saturating_mul(bps) / U256::from(10_000u64)
+        let amount_out_min = if req.amount_out_min.trim().is_empty() {
+            let bps = U256::from(10_000u64 - req.slippage_bps);
+            o.best.amount_out.saturating_mul(bps) / U256::from(10_000u64)
         } else {
-            parse_u256(&p.amount_out_min)
-        };
-        let deadline = if p.deadline > 0 { p.deadline } else { now_secs() + 1200 };
-
-        let built = {
-            let chain = match self.chain_cfg(chain_id) {
-                Ok(c) => c,
-                Err(e) => return err(e),
-            };
-            swap::build_swap(&chain, &quote, token_in, token_out, amount_in, amount_out_min, recipient, U256::from(deadline))
-        };
-        match built {
-            Some(b) => {
-                let approve = b.approve.map(|(token, spender, data)| {
-                    json!({ "token": format!("{token}"), "spender": format!("{spender}"), "data": format!("0x{}", hex::encode(data)) })
-                });
-                json!({
-                    "ok": true,
-                    "version": format!("{:?}", quote.version),
-                    "fee": quote.fee,
-                    "router": format!("{}", b.router),
-                    "value": format!("0x{:x}", b.value),
-                    "data": format!("0x{}", hex::encode(b.data)),
-                    "amountOut": quote.amount_out.to_string(),
-                    "amountOutMin": amount_out_min.to_string(),
-                    "approve": approve,
-                })
-                .to_string()
+            match swap::parse_amount(&req.amount_out_min) {
+                Ok(m) => m,
+                Err(e) => return err(format!("amountOutMin: {e}")),
             }
-            None => err("could not build swap for the best route (V4 swaps are a fast-follow)"),
-        }
+        };
+        let deadline = if req.deadline > 0 { req.deadline } else { now_secs() + 1800 };
+
+        let native_in = swap::is_native(p.token_in);
+        let approval = swap::approval_needed(native_in, o.owner.allowance_for(o.spender), p.amount_in);
+        let names = swap::Names {
+            token_in: &name_of(&req.symbol_in, p.token_in),
+            token_out: &name_of(&req.symbol_out, p.token_out),
+        };
+        let built = swap::build_swap(
+            &o.chain,
+            &o.best,
+            p.token_in,
+            p.token_out,
+            p.amount_in,
+            amount_out_min,
+            recipient,
+            U256::from(deadline),
+            approval,
+            names,
+        );
+        let Some(built) = built else {
+            return err("could not build the swap for the best route");
+        };
+        let calls: Vec<Value> = built
+            .calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "kind": match c.kind { CallKind::Approve => "approve", CallKind::Swap => "swap" },
+                    "to": format!("{}", c.to),
+                    "value": format!("0x{:x}", c.value),
+                    "data": format!("0x{}", hex::encode(&c.data)),
+                    "gasLimitHint": c.gas_limit_hint,
+                    "label": c.label,
+                })
+            })
+            .collect();
+        let mut v = self.quote_json(chain_id, &req, &p, &o);
+        v["owner"] = json!(format!("{owner}"));
+        v["recipient"] = json!(format!("{recipient}"));
+        v["amountOutMin"] = json!(amount_out_min.to_string());
+        v["slippageBps"] = json!(req.slippage_bps);
+        v["deadline"] = json!(deadline);
+        v["calls"] = json!(calls);
+        v.to_string()
     }
 }
 
