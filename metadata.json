@@ -1,6 +1,6 @@
 {
   "name": "uniswap_module",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Uniswap price oracle + swap router: V2/V3/V4 token prices (best-rate, Multicall3-batched) and V2/V3 swap building. Multi-chain, configurable.",
   "author": "Logos Core Team",
   "type": "core",
@@ -8,7 +8,9 @@
   "concurrency": "multi",
   "category": "wallet",
   "main": "uniswap_module_plugin",
-  "dependencies": ["eth_rpc_module"],
+  "dependencies": [
+    { "name": "eth_rpc_module", "version": "~0.1.0" }
+  ],
   "include": [],
   "capabilities": [],
   "codegen": {
