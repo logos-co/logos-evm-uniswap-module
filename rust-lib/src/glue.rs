@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use crate::config::{ChainUniswap, ConfigStore, STABLE_DECIMALS};
 use crate::pricing::{self, parse_addr as parse_addr_opt, Version};
+use crate::reply::err;
 use crate::swap::{self, Approval, CallKind, Quoted};
 
 pub trait UniswapModule: Send + Sync + 'static {
@@ -53,10 +54,6 @@ const RPC_BUDGET: Duration = Duration::from_millis(15_000);
 /// The deadline handed to eth_rpc: the budget less the margin the transport itself needs.
 fn callee_deadline(t: Duration) -> Option<i64> {
     t.checked_sub(Duration::from_millis(300)).map(|d| d.as_millis() as i64)
-}
-
-fn err(e: impl std::fmt::Display) -> String {
-    json!({ "ok": false, "error": e.to_string() }).to_string()
 }
 
 /// Native ETH is "ETH"/""/`0x0…0`; everything else is a 20-byte address.
@@ -217,7 +214,7 @@ impl UniswapModuleImpl {
 
     /// Issue `aggregate3(calls)` through eth_rpc and return per-call results plus the
     /// route eth_rpc served it by. Touches no module state, so no lock is held across
-    /// the blocking call.
+    /// the blocking call. A refusal is eth_rpc's own reply, returned whole for `err` to relay.
     fn run_multicall(
         &self,
         chain_id: i64,
@@ -235,7 +232,7 @@ impl UniswapModuleImpl {
             .map_err(|e| format!("{e:?}"))?;
         let v: Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
         if v.get("ok").and_then(Value::as_bool) == Some(false) {
-            return Err(v.get("error").and_then(Value::as_str).unwrap_or("eth_call failed").to_string());
+            return Err(resp);
         }
         let result_hex = v.get("result").and_then(Value::as_str).ok_or("multicall: no result")?;
         let bytes = hex::decode(result_hex.trim_start_matches("0x")).map_err(|e| e.to_string())?;
