@@ -157,7 +157,7 @@ let call_json = json!({ "to": multicall3, "data": format!("0x{}", hex::encode(da
 let resp = modules().eth_rpc_module.call(chain_id, &call_json).map_err(|e| e.to_string())?;
 let v: Value = serde_json::from_str(&resp)?;
 if v.get("ok").and_then(Value::as_bool) == Some(false) {
-    return Err(v.get("error").and_then(Value::as_str).unwrap_or("eth_call failed").to_string());
+    return Err(resp);
 }
 let result_hex = v.get("result").and_then(Value::as_str).ok_or("multicall: no result")?;
 ```
@@ -186,7 +186,9 @@ let result_hex = v.get("result").and_then(Value::as_str).ok_or("multicall: no re
 The public API is the `pub trait UniswapModule` in `rust-lib/src/glue.rs`. Every
 method is exposed to other modules and to `logoscore` (`call <module> <method>
 [args…]`). Unless noted, the return is a **JSON string**; the error convention is
-`{ "ok": false, "error": "<message>" }` (`err()` helper). Native ETH is
+`{ "ok": false, "error": "<message>" }` (`err()` helper). A refusal from `eth_rpc_module`
+is relayed verbatim, not flattened to its `error` text: its `code` and, for
+`verified_blocked`, the `verifiedProxy` verdict reach the caller. Native ETH is
 written as `"ETH"`, `"native"`, `""`, or `0x000…0`; everything else is a 20-byte
 address.
 
@@ -583,7 +585,7 @@ uniswap_module)` macro from `LogosModule.cmake`.
 
 ```bash
 cd rust-lib
-cargo test --no-default-features        # config + pricing + swap, no Logos/Qt
+cargo test --no-default-features        # config + pricing + swap + reply, no Logos/Qt
 ```
 
 Covered: CREATE2 against known mainnet pools, V2/V3 price recovery, V2 reserve
@@ -681,11 +683,12 @@ This is the same pattern as the wallet's other `concurrency:multi` module
 | `flake.nix` | Nix build via `mkLogosModule`; declares the `eth_rpc_module` input with a `follows` on `logos-module-builder` |
 | `CMakeLists.txt` | `logos_module(NAME uniswap_module)` |
 | `rust-lib/Cargo.toml` | Crate (`alloy` sol-types only, `hex`, `serde`; optional `logos-rust-sdk` behind `logos_module`) |
-| `rust-lib/src/lib.rs` | Crate root; exposes `config`/`pricing`/`swap`, gates `glue` behind `logos_module` |
+| `rust-lib/src/lib.rs` | Crate root; exposes `config`/`pricing`/`reply`/`swap`, gates `glue` behind `logos_module` |
 | `rust-lib/src/glue.rs` | **Public API** (`pub trait UniswapModule`), `UniswapModuleImpl`, `run_multicall`, the `modules().eth_rpc_module.call` site |
 | `rust-lib/src/config.rs` | `ChainUniswap`, `ConfigStore`, `default_chains()`, persistence |
 | `rust-lib/src/pricing.rs` | CREATE2, Multicall3 encode/decode, V2/V3/V4 price math, `pick_best`, `token_usd_prices` |
 | `rust-lib/src/swap.rs` | V2/V3 quote calldata + decode, `decode_best_quote`, router `build_swap` + approvals |
+| `rust-lib/src/reply.rs` | `err`, the error reply: a dependency's `{ ok:false }` refusal verbatim, anything else wrapped |
 | `doctests/uniswap-module-runtime.test.yaml` | Executable end-to-end doc-test (mock-node `get_prices` round-trip) |
 | `doctests/outputs/uniswap-module-runtime.md` | Rendered doc-test output |
 | `doctests/run.sh` | Local doc-test runner |

@@ -1,7 +1,7 @@
 name: uniswap_module Unit Tests
 
-# The pure cores on every change: chain config, pricing maths, and the swap quoter/encoder
-# (routes, probes, price impact, approvals, SwapRouter02 encoding).
+# The pure cores on every change: chain config, pricing maths, the swap quoter/encoder
+# (routes, probes, price impact, approvals, SwapRouter02 encoding), and the error reply.
 #
 # `--no-default-features` drops the `logos_module` glue, and with it the logos-rust-sdk
 # path dependency — so this needs no nix, no module host and no network beyond crates.io.
@@ -44,15 +44,16 @@ jobs:
       - name: cargo test --no-default-features
         run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
 
-      - name: The swap and config tests must actually be present
+      - name: The swap, config and reply tests must actually be present
         run: |
           out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
           for t in swap::tests::a_v3_swap_is_a_multicall_with_the_deadline_and_an_unwrap_for_ether_out \
                    swap::tests::the_approval_policy_resets_a_stale_allowance_and_skips_a_sufficient_one \
                    swap::tests::an_amount_is_digits_or_hex_and_never_nothing \
                    config::tests::every_seeded_v3_router_is_swaprouter02 \
-                   config::tests::sepolia_pools_derive_from_the_canonical_hashes; do
+                   config::tests::sepolia_pools_derive_from_the_canonical_hashes \
+                   reply::tests::an_eth_rpc_refusal_is_relayed_byte_for_byte; do
             echo "$out" | grep -q "^$t: test$" || { echo "MISSING: $t"; exit 1; }
           done
           n=$(echo "$out" | grep -c ': test$')
-          echo "tests: $n"; [ "$n" -ge 28 ]
+          echo "tests: $n"; [ "$n" -ge 32 ]
