@@ -28,14 +28,14 @@ holds no keys**. Instead it:
    **deepest pool** as the token's ETH price, anchors token→USD on a configured
    stablecoin, and (for swaps) ABI-encodes the winning router calldata.
 
-### Where it sits in the 7-repo wallet
+### Where it sits
 
 ```
-logos-evm-wallet-ui                (universal C++ ui_qml app; Market tab)
+logos-uniswap-ui                   (universal C++ ui_qml app: the swap form, its activity)
         │  drives over the Logos bridge
         ▼
-logos-evm-wallet-backend-module    (coordinator; calls get_prices / quote_swap /
-        │                           build_swap for its Market tab + send pipeline)
+logos-uniswap-backend              (uniswap_backend: calls get_chains and build_swap,
+        │                           sends the calls through tx_sender_module)
         ▼
 logos-evm-uniswap-module  ◀── THIS REPO  (price oracle + swap quoter)
         │  module→module: modules().eth_rpc_module.call(chainId, callJson)
@@ -47,15 +47,16 @@ logos-evm-net-proxy (library)      (fail-closed SOCKS5 chokepoint, vendored by e
 the chain's JSON-RPC node
 ```
 
-This module is the wallet's **market view**: `wallet_backend_module` exposes a
-`get_market` that fans out into this module's `get_prices`, and the UI's Market
-tab renders the result. Swaps flow `wallet-ui → backend → uniswap.build_swap →`
-backend signs/broadcasts (via `keystore_module` + `eth_rpc_module`).
+Its caller is `uniswap_backend`, the Uniswap app's backend. It reads `get_chains`
+and prices a swap with `build_swap`, then hands the calls `build_swap` returns to
+`tx_sender_module`, which has them signed through `keystore_module` and broadcasts
+them through `eth_rpc_module`. Nothing in the stack calls `get_prices` or `quote_swap`
+today; `logoscore -c` reaches every method.
 
 **Direct dependency:** `eth_rpc_module` (declared in `metadata.json`
 `dependencies`, wired in `flake.nix`). This module is a **leaf** with respect to
-other wallet modules — `keystore`, `token-list`, `wallet-backend` do not call it
-in reverse; the backend calls *into* it.
+other wallet modules: none of them is called from here, and `uniswap_backend` calls
+*into* it.
 
 ---
 
@@ -67,7 +68,7 @@ with `cargo test --no-default-features`) and a **glue layer** (behind the defaul
 
 ```mermaid
 flowchart TB
-    subgraph consumer["Caller (wallet_backend_module / logoscore -c)"]
+    subgraph consumer["Caller (uniswap_backend / logoscore -c)"]
         C["configure / get_chains / get_prices / quote_swap / build_swap"]
     end
 
@@ -125,7 +126,7 @@ batch quote calls instead of pool reads).
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Caller as Caller<br/>(backend / logoscore)
+    participant Caller as Caller<br/>(uniswap_backend / logoscore)
     participant Uni as uniswap_module<br/>(glue.rs)
     participant Pri as pricing.rs<br/>(pure)
     participant Eth as eth_rpc_module<br/>(modules().eth_rpc_module)
@@ -667,7 +668,7 @@ This is the same pattern as the wallet's other `concurrency:multi` module
 |---|---|
 | **No direct network access.** The module never opens a socket. | All on-chain reads go through `modules().eth_rpc_module.call`; the crate pulls in no HTTP client (`alloy` is `default-features = false`, `sol-types` only). |
 | **Fail-closed privacy preserved.** | Because the only egress is `eth_rpc_module`, the wallet's `net-proxy` SOCKS5 chokepoint still governs every request — this module can't bypass it. |
-| **No keys / no signing.** | The module builds **unsigned** calldata only (`build_swap` returns `(router, value, data, approve)`); signing/broadcast is the backend + `keystore_module`. |
+| **No keys / no signing.** | The module builds **unsigned** calldata only (`build_swap` returns `(router, value, data, approve)`); signing and broadcast are `tx_sender_module`'s, through `keystore_module` and `eth_rpc_module`. |
 | **One batch, one decoder.** | `run_multicall` encodes a single `aggregate3` and decodes via `decode_aggregate3_returns` — never hand-split the hex (see §3 warning). |
 | **`allowFailure = true` per sub-call.** | A non-existent pool reverting one read won't sink the whole batch (`Call3.allowFailure = true`); reverted reads decode to `None` and are simply skipped. |
 | **Offline address derivation is checksum-agnostic but exact.** | CREATE2 derivation is verified against known mainnet pools in unit tests; a wrong factory/init-hash in config just yields empty pools (priced as `null`), never a wrong-but-plausible address from an untrusted source. |
