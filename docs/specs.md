@@ -307,14 +307,21 @@ logoscore call uniswap_module get_prices 31337 @tokens.json
 fn quote_swap(&self, chain_id: i64, params_json: String) -> String
 ```
 
-The **best route** for `amountIn` of `tokenIn → tokenOut`, in **one Multicall3 round
-trip**. Candidates: V2 direct, V2 via WETH, V3 direct on every configured fee tier, and V3
+The **best route** for `amountIn` of `tokenIn → tokenOut`, in **two Multicall3 round
+trips**. Candidates: V2 direct, V2 via WETH, V3 direct on every configured fee tier, and V3
 via WETH on every pair of tiers (22 routes on a chain with both versions and four tiers).
-Beside every candidate rides a **probe** quote of a thousandth of the amount; the winning
-route's probe gives the marginal rate, and the shortfall of the real rate against it is the
-**price impact**. With an `owner`, the same batch reads that account's balance of the input
-token and its allowance for each router, so the reply also says whether the swap can be
-paid for and whether an approval must go first.
+The first batch quotes every candidate once; the second asks the winning route alone for a
+**probe** quote of a thousandth of the amount, which gives the marginal rate, and the
+shortfall of the real rate against it is the **price impact**. The probe is optional: if it
+fails or times out, the quote still returns with `priceImpactBps: null`. With an `owner`,
+the first batch also reads that account's balance of the input token and its allowance for
+each router, so the reply also says whether the swap can be paid for and whether an
+approval must go first.
+
+Through a verified proxy every quoter call costs proofs, and one failed proof fetch fails
+the whole `eth_call`, so the first batch carries only what choosing a route needs. Its
+budget is 30 s (a mainnet ETH/USDT batch measured 18–29 s on a free provider); the probe's
+is 8 s.
 
 | Param | Type | Meaning |
 |---|---|---|
@@ -540,9 +547,10 @@ omitted entirely (prices come back with `usd: null`).
 - **Candidates.** `candidate_routes` enumerates V2 direct, V2 via WETH, V3 direct per fee
   tier, V3 via WETH per tier pair — 22 on a full chain. Nothing goes "via WETH" when one
   side already is WETH, and ether against WETH is a wrap, not a swap (no routes).
-- **The batch.** `build_quote_batch` emits, per route, the quote and its probe
-  (`probe_amount` = `amountIn / 1000`, at least 1): V2 `getAmountsOut(path)`, V3
-  `QuoterV2.quoteExactInputSingle` or `quoteExactInput(path)`. With an owner it appends
+- **The batch.** `build_quote_batch` emits one quote per route: V2 `getAmountsOut(path)`,
+  V3 `QuoterV2.quoteExactInputSingle` or `quoteExactInput(path)`. `probe_call` is the same
+  call for the winner at `probe_amount` (`amountIn / 1000`, at least 1), sent on its own
+  after the batch and read with `decode_probe`. With an owner it appends
   `balanceOf(owner)` (or Multicall3 `getEthBalance`) and, via `with_allowance_read`, one
   `allowance(owner, router)` per router the chain has — the winner's router is not known
   until the quotes are back.

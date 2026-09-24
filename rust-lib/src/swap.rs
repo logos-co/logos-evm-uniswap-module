@@ -197,8 +197,10 @@ pub fn probe_amount(amount_in: U256) -> U256 {
 
 // ── The batch ────────────────────────────────────────────────────────────────
 
-/// Every read a quote needs, in one Multicall3: per route the real quote then its probe,
-/// then the owner's balance and allowance if an owner was named.
+/// The reads that pick a route, in one Multicall3: one quote per route, then the owner's
+/// balance and allowance if an owner was named. The probe is asked for the winner alone
+/// afterwards ([`probe_call`]): through a verified proxy each quote costs proofs, and one
+/// failed fetch fails the whole batch, so the batch stays as small as the choice needs.
 pub struct QuoteBatch {
     pub calls: Vec<(Address, Vec<u8>)>,
     routes: Vec<Route>,
@@ -215,7 +217,7 @@ pub struct Quoted {
     pub amount_out: U256,
     /// QuoterV2's own gas estimate of the pool legs (V3 only).
     pub gas_estimate: Option<u64>,
-    /// What the probe amount would have fetched on the same route.
+    /// What the probe amount would have fetched on the same route; set on the winner only.
     pub probe_out: Option<U256>,
 }
 
@@ -309,12 +311,8 @@ pub fn build_quote_batch(
     let mut calls = Vec::new();
     let mut routes = Vec::new();
     for route in candidate_routes(chain, token_in, token_out) {
-        let (Some(main), Some(probe)) = (quote_call(chain, &route, amount_in), quote_call(chain, &route, probe_in))
-        else {
-            continue;
-        };
+        let Some(main) = quote_call(chain, &route, amount_in) else { continue };
         calls.push(main);
-        calls.push(probe);
         routes.push(route);
     }
     let mut balance_at = None;
@@ -362,12 +360,11 @@ pub fn decode_quotes(batch: &QuoteBatch, results: &[Option<Vec<u8>>]) -> (Vec<Qu
     };
     let mut quotes = Vec::new();
     for (n, route) in batch.routes.iter().enumerate() {
-        let Some((amount_out, gas_estimate)) = decode(2 * n, route) else { continue };
+        let Some((amount_out, gas_estimate)) = decode(n, route) else { continue };
         if amount_out.is_zero() {
             continue;
         }
-        let probe_out = decode(2 * n + 1, route).map(|(a, _)| a).filter(|a| !a.is_zero());
-        quotes.push(Quoted { route: route.clone(), amount_out, gas_estimate, probe_out });
+        quotes.push(Quoted { route: route.clone(), amount_out, gas_estimate, probe_out: None });
     }
     let read = |i: usize| results.get(i).and_then(|r| r.as_ref()).and_then(|d| word(d, 0));
     let owner = OwnerState {
@@ -375,6 +372,21 @@ pub fn decode_quotes(batch: &QuoteBatch, results: &[Option<Vec<u8>>]) -> (Vec<Qu
         allowances: batch.allowance_at.iter().filter_map(|(s, i)| read(*i).map(|a| (*s, a))).collect(),
     };
     (quotes, owner)
+}
+
+/// The probe quote for the winning route: the same call at a thousandth of the amount.
+pub fn probe_call(chain: &ChainUniswap, route: &Route, probe_in: U256) -> Option<(Address, Vec<u8>)> {
+    quote_call(chain, route, probe_in)
+}
+
+/// Decode [`probe_call`]'s answer. `None` for a revert or a zero output.
+pub fn decode_probe(route: &Route, data: &[u8]) -> Option<U256> {
+    let out = match route.version {
+        Version::V2 => decode_amounts_out(data),
+        Version::V3 => decode_v3_quote(data).map(|(a, _)| a),
+        Version::V4 => None,
+    };
+    out.filter(|a| !a.is_zero())
 }
 
 /// The route with the largest output; between equals, the one with fewer hops.
@@ -719,9 +731,9 @@ mod tests {
         assert!(routes.iter().all(|r| r.tokens[0] == WETH));
         // Ether against WETH is a wrap, not a swap.
         assert!(candidate_routes(&chain, Address::ZERO, WETH).is_empty());
-        // Each route costs two calls: the quote and its probe.
+        // One call per route: the probe waits for the winner.
         let batch = build_quote_batch(&chain, USDC, DAI, U256::from(1_000_000u64), None);
-        assert_eq!(batch.calls.len(), 44);
+        assert_eq!(batch.calls.len(), 22);
         assert_eq!(batch.probe_in(), U256::from(1_000u64));
     }
 
@@ -740,21 +752,21 @@ mod tests {
         let batch = with_allowance_read(batch, USDC, ALICE, ROUTER02);
         let batch = with_allowance_read(batch, USDC, ALICE, v2);
         let batch = with_allowance_read(batch, USDC, ALICE, v2); // asked twice, read once
-        assert_eq!(batch.calls.len(), 2 * n + 3);
-        assert_eq!(batch.calls[2 * n].0, USDC); // balanceOf on the token
-        assert_eq!(&batch.calls[2 * n].1[..4], &[0x70, 0xa0, 0x82, 0x31]);
-        assert_eq!(batch.calls[2 * n + 1].0, USDC); // allowance on the token, per router
-        assert_eq!(batch.calls[2 * n + 2].0, USDC);
+        assert_eq!(batch.calls.len(), n + 3);
+        assert_eq!(batch.calls[n].0, USDC); // balanceOf on the token
+        assert_eq!(&batch.calls[n].1[..4], &[0x70, 0xa0, 0x82, 0x31]);
+        assert_eq!(batch.calls[n + 1].0, USDC); // allowance on the token, per router
+        assert_eq!(batch.calls[n + 2].0, USDC);
         // Ether: the balance comes from Multicall3 and there is no allowance to read.
         let batch = build_quote_batch(&chain, Address::ZERO, USDC, U256::from(1u64), Some(ALICE));
         let m = candidate_routes(&chain, Address::ZERO, USDC).len();
         let batch = with_allowance_read(batch, Address::ZERO, ALICE, ROUTER02);
-        assert_eq!(batch.calls.len(), 2 * m + 1);
-        assert_eq!(batch.calls[2 * m].0, parse_addr(&chain.multicall3).unwrap());
+        assert_eq!(batch.calls.len(), m + 1);
+        assert_eq!(batch.calls[m].0, parse_addr(&chain.multicall3).unwrap());
     }
 
     #[test]
-    fn the_best_route_is_the_largest_output_and_the_probe_travels_with_it() {
+    fn the_best_route_is_the_largest_output_and_only_it_is_probed() {
         let chain = mainnet();
         let amount = U256::from(1_000_000u64);
         let batch = build_quote_batch(&chain, USDC, DAI, amount, Some(ALICE));
@@ -762,16 +774,13 @@ mod tests {
         let routes = candidate_routes(&chain, USDC, DAI);
         let mut results: Vec<Option<Vec<u8>>> = Vec::new();
         for (i, r) in routes.iter().enumerate() {
-            // Route 7 (V3 via WETH, tiers 100/500) wins with 990; its probe answers 1 for the
-            // 1000-unit probe amount, i.e. a rate of 0.001 against the real 0.00099.
-            let (main, probe) = if i == 7 { (990u64, 1u64) } else { (900, 1) };
-            let ret = |amt: u64| match r.version {
-                Version::V2 => v2_ret(amt),
-                Version::V3 if r.hops() == 1 => quote_ret(amt, 120_000),
-                _ => path_quote_ret(amt, 240_000),
-            };
-            results.push(Some(ret(main)));
-            results.push(Some(ret(probe)));
+            // Route 7 (V3 via WETH, tiers 100/500) wins with 990.
+            let main = if i == 7 { 990u64 } else { 900 };
+            results.push(Some(match r.version {
+                Version::V2 => v2_ret(main),
+                Version::V3 if r.hops() == 1 => quote_ret(main, 120_000),
+                _ => path_quote_ret(main, 240_000),
+            }));
         }
         results.push(Some(word_ret(5_000_000))); // balance
         results.push(Some(word_ret(0))); // allowance
@@ -781,7 +790,13 @@ mod tests {
         assert_eq!(best.route, routes[7]);
         assert_eq!(best.amount_out, U256::from(990u64));
         assert_eq!(best.gas_estimate, Some(240_000));
-        assert_eq!(best.probe_out, Some(U256::from(1u64)));
+        assert_eq!(best.probe_out, None);
+        // The probe is the winner's own call at a thousandth of the amount. It answers 1,
+        // a rate of 0.001 against the real 0.00099.
+        let (to, data) = probe_call(&chain, &best.route, batch.probe_in()).unwrap();
+        assert_eq!((to, data), quote_call(&chain, &best.route, U256::from(1_000u64)).unwrap());
+        assert_eq!(decode_probe(&best.route, &path_quote_ret(1, 240_000)), Some(U256::from(1u64)));
+        assert_eq!(decode_probe(&best.route, &path_quote_ret(0, 240_000)), None);
         assert_eq!(owner, OwnerState { balance_in: Some(U256::from(5_000_000u64)), allowances: vec![(ROUTER02, U256::ZERO)] });
         assert_eq!(owner.allowance_for(ROUTER02), Some(U256::ZERO));
         assert_eq!(owner.allowance_for(ALICE), None);
@@ -794,15 +809,15 @@ mod tests {
         let chain = mainnet();
         let batch = build_quote_batch(&chain, Address::ZERO, USDC, U256::from(10u64), None);
         let routes = candidate_routes(&chain, Address::ZERO, USDC);
-        let mut results: Vec<Option<Vec<u8>>> = vec![None; 2 * routes.len()];
-        results[2] = Some(quote_ret(30, 90_000)); // first V3 tier answers, its probe does not
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; routes.len()];
+        results[1] = Some(quote_ret(30, 90_000)); // only the first V3 tier answers
         let (quotes, owner) = decode_quotes(&batch, &results);
         assert_eq!(quotes.len(), 1);
-        assert_eq!(quotes[0].probe_out, None);
+        assert_eq!(quotes[0].route, routes[1]);
         assert_eq!(owner, OwnerState::default());
         assert_eq!(price_impact_bps(U256::from(10u64), U256::from(30u64), U256::from(1u64), U256::ZERO), None);
         // A zero output is not a quote either.
-        results[2] = Some(quote_ret(0, 0));
+        results[1] = Some(quote_ret(0, 0));
         assert!(decode_quotes(&batch, &results).0.is_empty());
     }
 
