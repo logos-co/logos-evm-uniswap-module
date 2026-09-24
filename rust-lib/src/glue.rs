@@ -47,9 +47,14 @@ struct UniswapModuleImpl {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-/// One Multicall3 read through eth_rpc. A quote batch is tens of quoter calls, which a
-/// public node answers in a second or two; the verified proxy adds a proof round trip.
-const RPC_BUDGET: Duration = Duration::from_millis(15_000);
+/// One Multicall3 read through eth_rpc. A public node answers a quote batch in a second or
+/// two; the verified proxy fetches proofs for every slot the batch touches, and a mainnet
+/// ETH/USDT batch measured 18–29 s on a free provider (2026-09-24).
+const RPC_BUDGET: Duration = Duration::from_millis(30_000);
+
+/// The winner's probe: one quoter call, and optional — a slow one costs the impact figure,
+/// not the quote.
+const PROBE_BUDGET: Duration = Duration::from_millis(8_000);
 
 /// The deadline handed to eth_rpc: the budget less the margin the transport itself needs.
 fn callee_deadline(t: Duration) -> Option<i64> {
@@ -220,6 +225,7 @@ impl UniswapModuleImpl {
         chain_id: i64,
         multicall3: &str,
         calls: &[(Address, Vec<u8>)],
+        budget: Duration,
     ) -> Result<(Vec<Option<Vec<u8>>>, Option<String>), String> {
         if calls.is_empty() {
             return Ok((Vec::new(), None));
@@ -228,7 +234,7 @@ impl UniswapModuleImpl {
         let call_json = json!({ "to": multicall3, "data": format!("0x{}", hex::encode(data)) }).to_string();
         let resp = modules()
             .eth_rpc_module
-            .call_with_timeout(chain_id, &call_json, callee_deadline(RPC_BUDGET), RPC_BUDGET)
+            .call_with_timeout(chain_id, &call_json, callee_deadline(budget), budget)
             .map_err(|e| format!("{e:?}"))?;
         let v: Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
         if v.get("ok").and_then(Value::as_bool) == Some(false) {
@@ -256,10 +262,14 @@ impl UniswapModuleImpl {
                 }
             }
         }
-        let (results, rpc_route) = self.run_multicall(chain_id, &chain.multicall3, &batch.calls)?;
+        let (results, rpc_route) = self.run_multicall(chain_id, &chain.multicall3, &batch.calls, RPC_BUDGET)?;
         let (quotes, owner) = swap::decode_quotes(&batch, &results);
-        let best = swap::pick_best(&quotes).cloned().ok_or_else(|| "no route found".to_string())?;
+        let mut best = swap::pick_best(&quotes).cloned().ok_or_else(|| "no route found".to_string())?;
         let spender = swap::router_for(&chain, best.route.version).ok_or("no router for the winning route")?;
+        best.probe_out = swap::probe_call(&chain, &best.route, batch.probe_in())
+            .and_then(|call| self.run_multicall(chain_id, &chain.multicall3, &[call], PROBE_BUDGET).ok())
+            .and_then(|(r, _)| r.into_iter().next().flatten())
+            .and_then(|data| swap::decode_probe(&best.route, &data));
         let impact_bps = best
             .probe_out
             .and_then(|po| swap::price_impact_bps(p.amount_in, best.amount_out, batch.probe_in(), po));
@@ -354,7 +364,7 @@ impl UniswapModule for UniswapModuleImpl {
             (chain.multicall3.clone(), weth, stable_addrs, pricing::build_pricing_batch(&chain, weth, &priced))
         };
 
-        let (results, _) = match self.run_multicall(chain_id, &mc, &batch.calls) {
+        let (results, _) = match self.run_multicall(chain_id, &mc, &batch.calls, RPC_BUDGET) {
             Ok(r) => r,
             Err(e) => return err(e),
         };

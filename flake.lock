@@ -162,11 +162,11 @@
         "verified_proxy_module": "verified_proxy_module"
       },
       "locked": {
-        "lastModified": 1789860982,
-        "narHash": "sha256-H4IX0WIZ8ugOVYORrnB6BouI5pidvhgO+7XA+LB7Ag4=",
+        "lastModified": 1790274559,
+        "narHash": "sha256-Iefdc4HGccWqMhI7FnuvyxWYlU3E35bzDjuaSs3WhlA=",
         "owner": "logos-co",
         "repo": "logos-evm-eth-rpc-module",
-        "rev": "49158948e873326a176dc136f2889daab8053d43",
+        "rev": "42cc465e0cbd748117a0af0cf983404348683335",
         "type": "github"
       },
       "original": {
