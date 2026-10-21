@@ -1,4 +1,4 @@
-name: "Pricing and Quoting Swaps with the Uniswap Module on logoscore"
+name: "Pricing and Quoting Swaps with the Uniswap Module on logosctl"
 output: uniswap-module-runtime.md
 release: ""
 
@@ -12,7 +12,7 @@ intro: |
   multi-chain and fully configurable, and it talks to the network only through
   `eth_rpc_module`, so the wallet's fail-closed proxy still governs every request.
 
-  This doc-test drives the module through a `logoscore` daemon. The pure pricing
+  This doc-test drives the module through a `logosctl` daemon. The pure pricing
   math (CREATE2 derivation, `sqrtPriceX96`/reserve maths, best-rate selection,
   Multicall3 encode/decode) is covered by the crate's unit tests; here we prove
   the **runtime** path end-to-end against a **local mock JSON-RPC node** (no
@@ -31,7 +31,7 @@ intro: |
      allowance — and the reply carries the approve-then-swap calls a sender
      needs, with a price impact and a gas hint for each.
 
-what_you_build: "This `uniswap_module`, packaged as `.lgx`, installed with `lgpm` alongside `eth_rpc_module`, and driven through a `logoscore` daemon against a local mock node: a price, a swap quote, and the swap's calls."
+what_you_build: "This `uniswap_module`, packaged as `.lgx`, installed alongside `eth_rpc_module` into a `logosctl` session, and driven through its daemon against a local mock node: a price, a swap quote, and the swap's calls."
 
 what_you_learn:
   - How the module ships a seeded, configurable multi-chain Uniswap deployment map
@@ -50,14 +50,15 @@ prerequisites:
   - "**A Linux or macOS machine** with `python3` available (used to run the local mock JSON-RPC node)."
 
 sections:
-  - title: "Build logoscore and lgpm"
+  - title: "Build logosctl"
     step: true
     steps:
-      - title: "Build logoscore"
+      - title: "Build logosctl"
         text: |
           `uniswap_module` is `concurrency: "multi"`, so the daemon resolves its
-          logos-protocol ≥ 0.2. logoscore-cli pins 0.8, so its own lock already
-          satisfies that and no `--override-input` is needed.
+          deferred replies on the caller's behalf — it must be built against
+          logos-protocol ≥ 0.2. logoscore-cli's own lock already satisfies that,
+          so no `--override-input` is needed.
 
           The overrides that used to be here moved logos-protocol and
           logos-liblogos/logos-protocol but not logos-plugin-qt's. An override
@@ -67,13 +68,10 @@ sections:
           88 -> 96 bytes, the pair disagreed and every getClient overran the heap:
           `free(): invalid next size` on glibc, silent on macOS. Completing the set
           instead trips logos-plugin-qt's own consumer-admission bound.
-        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos"
         code_block: |
-          nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
-        check_file: "logos/bin/logoscore"
-      - title: "Build lgpm"
-        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
-        check_file: "lgpm/bin/lgpm"
+          nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos
+        check_file: "logos/bin/logosctl"
 
   - title: "Build and install the modules"
     step: true
@@ -93,21 +91,35 @@ sections:
           nix build 'github:logos-co/logos-evm-uniswap-module{release}#lgx' -o uniswap-lgx
         extra_run:
           run: "ls uniswap-lgx/*.lgx"
-      - title: "Seed the capability module"
+      - title: "Start the daemon"
+        text: |
+          The session directory, `./session`, holds the daemon's config, its
+          installed modules and their data. `--detach` returns once the daemon
+          accepts commands.
+        # The bundled package downloader starts a storage node in $HOME; keep it
+        # out of the real one.
+        run: "mkdir -p home && HOME=\"$PWD/home\" ./logos/bin/logosctl --config-dir ./session daemon start --detach"
+        code_block: "logosctl daemon start --detach"
+        expect_contains:
+          - "Daemon started"
+      - title: "Install both .lgx"
+        text: |
+          A path ending in `.lgx` installs from disk, with no catalog involved. A
+          local build is unsigned, which the session's default policy accepts with
+          a warning. `-y` confirms, since there is no terminal to ask on.
         run: |
-          mkdir -p modules
-          cp -RL ./logos/modules/. ./modules/
-        check_file: "modules/capability_module/manifest.json"
-      - title: "Install eth_rpc_module"
-        run: "./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file eth-rpc-lgx/*.lgx"
+          set -e
+          ./logos/bin/logosctl --config-dir ./session install eth-rpc-lgx/*.lgx -y
+          ./logos/bin/logosctl --config-dir ./session install uniswap-lgx/*.lgx -y
+        code_block: |
+          logosctl install eth-rpc-lgx/*.lgx -y
+          logosctl install uniswap-lgx/*.lgx -y
         expect_contains:
-          - "Installed to:"
-      - title: "Install uniswap_module"
-        run: "./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file uniswap-lgx/*.lgx"
-        expect_contains:
-          - "Installed to:"
+          - '"installed":["eth_rpc_module"]'
+          - '"installed":["uniswap_module"]'
       - title: "Confirm the installs"
-        run: "./lgpm/bin/lgpm --modules-dir ./modules list"
+        run: "./logos/bin/logosctl --config-dir ./session package ls"
+        code_block: "logosctl package ls"
         expect_contains:
           - "uniswap_module"
           - "eth_rpc_module"
@@ -196,28 +208,20 @@ sections:
             print('listening on %s:%d after %.1fs' % (host, port, time.time() - t0), flush=True)
             srv.serve_forever()
       - title: "Start the mock node"
-        run: "sh -c 'python3 mock_node.py > mock.log 2>&1 &'"
+        run: "sh -c 'python3 mock_node.py > mock.log 2>&1 & echo $! > mock.pid'"
         code_block: "python3 mock_node.py &"
       - run: "sleep 2"
 
-  - title: "Run the daemon and price a token"
+  - title: "Price a token"
     step: true
     steps:
-      - title: "Start the daemon"
-        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
-        code_block: "logoscore -D -m ./modules > logs.txt &"
-      # The daemon writes its client config once it has booted, and a loaded machine can
-      # take longer than a fixed sleep: wait for the file rather than for a number.
-      - run: |
-          for i in $(seq 1 60); do
-            [ -f .logoscore/client/config.json ] && break
-            sleep 1
-          done
-          sleep 1
       - title: "Load the modules"
         run: |
-          ./logos/bin/logoscore load-module eth_rpc_module
-          ./logos/bin/logoscore load-module uniswap_module
+          ./logos/bin/logosctl --config-dir ./session module load eth_rpc_module
+          ./logos/bin/logosctl --config-dir ./session module load uniswap_module
+        code_block: |
+          logosctl module load eth_rpc_module
+          logosctl module load uniswap_module
         expect_contains:
           - "uniswap_module"
       - title: "Read the seeded multi-chain config"
@@ -225,8 +229,8 @@ sections:
           The module ships sensible defaults for Ethereum, Sepolia (chainId
           11155111), Optimism, Arbitrum and Base (chainId 8453). Every V3 router
           in the seed is **SwapRouter02**.
-        run: "./logos/bin/logoscore call uniswap_module get_chains"
-        code_block: "logoscore call uniswap_module get_chains"
+        run: "./logos/bin/logosctl --config-dir ./session call uniswap_module get_chains"
+        code_block: "logosctl call uniswap_module get_chains"
         expect_contains:
           - "chains"
           - "8453"
@@ -250,8 +254,8 @@ sections:
               "v2Router": "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
             }
       - title: "Apply the Uniswap chain config"
-        run: "./logos/bin/logoscore call uniswap_module configure @uni_chain.json"
-        code_block: "logoscore call uniswap_module configure @uni_chain.json"
+        run: "./logos/bin/logosctl --config-dir ./session call uniswap_module configure @uni_chain.json"
+        code_block: "logosctl call uniswap_module configure @uni_chain.json"
         expect_contains:
           - "true"
       - title: "Point eth_rpc chain 31337 at the mock node"
@@ -260,8 +264,8 @@ sections:
           content: |
             { "endpoint": "http://127.0.0.1:8601", "proxyRequired": false }
       - title: "Apply the eth_rpc chain config"
-        run: "./logos/bin/logoscore call eth_rpc_module set_chain_config 31337 @rpc_chain.json"
-        code_block: "logoscore call eth_rpc_module set_chain_config 31337 @rpc_chain.json"
+        run: "./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_config 31337 @rpc_chain.json"
+        code_block: "logosctl call eth_rpc_module set_chain_config 31337 @rpc_chain.json"
         expect_contains:
           - "true"
       - title: "Price USDC (Multicall3 round-trip through eth_rpc)"
@@ -280,11 +284,11 @@ sections:
         # get_prices is a pure read, so retrying is side-effect-free.
         run: |
           for i in 1 2 3 4 5 6; do
-            out=$(./logos/bin/logoscore call uniswap_module get_prices 31337 @tokens.json 2>&1)
+            out=$(./logos/bin/logosctl --config-dir ./session call uniswap_module get_prices 31337 @tokens.json 2>&1)
             case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
           done
           printf '%s\n' "$out"
-        code_block: "logoscore call uniswap_module get_prices 31337 @tokens.json"
+        code_block: "logosctl call uniswap_module get_prices 31337 @tokens.json"
         expect_contains:
           - "prices"
           - "31337"
@@ -319,9 +323,9 @@ sections:
           reply carries the output, the route, the pool fee, the price impact
           in basis points, a gas hint, and the owner's balance and allowance —
           which is zero, so `needsApproval` is `true`.
-        run: "./logos/bin/logoscore call uniswap_module quote_swap 31337 @swap.json"
-        code_block: "logoscore call uniswap_module quote_swap 31337 @swap.json"
-        # `logoscore call` prints the module's reply as an escaped JSON string, so the
+        run: "./logos/bin/logosctl --config-dir ./session call uniswap_module quote_swap 31337 @swap.json"
+        code_block: "logosctl call uniswap_module quote_swap 31337 @swap.json"
+        # `logosctl call` prints the module's reply as an escaped JSON string, so the
         # quotes inside it are backslashed here.
         expect_contains:
           - '\"amountOut\":\"333277787035494084\"'
@@ -341,8 +345,8 @@ sections:
           router call, with `amountOutMin` at the default 0.5% slippage. Each
           call carries a gas hint and a label; `tx_sender_module` takes this
           list as one bundle, and the keystore asks the human once for both.
-        run: "./logos/bin/logoscore call uniswap_module build_swap 31337 @swap.json"
-        code_block: "logoscore call uniswap_module build_swap 31337 @swap.json"
+        run: "./logos/bin/logosctl --config-dir ./session call uniswap_module build_swap 31337 @swap.json"
+        code_block: "logosctl call uniswap_module build_swap 31337 @swap.json"
         expect_contains:
           - '\"calls\":['
           - '\"kind\":\"approve\"'
@@ -354,8 +358,8 @@ sections:
           - '\"slippageBps\":50'
           - '\"gasLimitHint\":180000'
       - title: "An amount that is not a number is refused, not read as zero"
-        run: "./logos/bin/logoscore call uniswap_module quote_swap 31337 '{\"tokenIn\":\"ETH\",\"tokenOut\":\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\",\"amountIn\":\"ten\"}' || true"
-        code_block: "logoscore call uniswap_module quote_swap 31337 '{\"tokenIn\":\"ETH\",\"tokenOut\":\"0xA0b8…eB48\",\"amountIn\":\"ten\"}'"
+        run: "./logos/bin/logosctl --config-dir ./session call uniswap_module quote_swap 31337 '{\"tokenIn\":\"ETH\",\"tokenOut\":\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\",\"amountIn\":\"ten\"}' || true"
+        code_block: "logosctl call uniswap_module quote_swap 31337 '{\"tokenIn\":\"ETH\",\"tokenOut\":\"0xA0b8…eB48\",\"amountIn\":\"ten\"}'"
         expect_contains:
           - "not an amount"
 
@@ -364,13 +368,12 @@ sections:
     steps:
       - title: "Stop the daemon and the mock node"
         run: |
-          trap '' TERM
-          ./logos/bin/logoscore stop || true
-          pkill -f mock_node.py 2>/dev/null || true
-          true
-      - run: "sleep 2"
+          ./logos/bin/logosctl --config-dir ./session daemon stop || true
+          kill "$(cat mock.pid)" 2>/dev/null || true
+        code_block: "logosctl daemon stop"
       - title: "Confirm the daemon has stopped"
-        run: "./logos/bin/logoscore status || true"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status || true"
+        code_block: "logosctl daemon status"
         expect_contains:
           - '"status":"not_running"'
         post_text: |

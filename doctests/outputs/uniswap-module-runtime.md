@@ -1,14 +1,15 @@
-# Pricing Tokens with the Uniswap Module on logoscore
+# Pricing and Quoting Swaps with the Uniswap Module on logosctl
 
-`logos-evm-uniswap-module` is the **price oracle and swap router** for the
-Logos multi-chain EVM wallet. It derives Uniswap pool addresses offline
-(CREATE2), bundles every on-chain read into a **single Multicall3 `eth_call`**,
-and returns best-rate token→ETH / token→USD prices across **Uniswap V2, V3 and
-V4** — plus V2/V3 swap-transaction building. It is multi-chain and fully
-configurable, and it talks to the network only through `eth_rpc_module`, so the
-wallet's fail-closed proxy still governs every request.
+`logos-evm-uniswap-module` is the **price oracle and swap quoter** for the
+Logos EVM wallet. It derives Uniswap pool addresses offline (CREATE2), bundles
+every on-chain read into a **single Multicall3 `eth_call`**, and returns
+best-rate token→ETH / token→USD prices across **Uniswap V2, V3 and V4** — plus
+V2/V3 swap quotes and the calls that make them. It holds no key and sends
+nothing: a swap app hands the calls it builds to `tx_sender_module`. It is
+multi-chain and fully configurable, and it talks to the network only through
+`eth_rpc_module`, so the wallet's fail-closed proxy still governs every request.
 
-This doc-test drives the module through a `logoscore` daemon. The pure pricing
+This doc-test drives the module through a `logosctl` daemon. The pure pricing
 math (CREATE2 derivation, `sqrtPriceX96`/reserve maths, best-rate selection,
 Multicall3 encode/decode) is covered by the crate's unit tests; here we prove
 the **runtime** path end-to-end against a **local mock JSON-RPC node** (no
@@ -16,19 +17,25 @@ external network, reproducible in CI):
 
 1. Build/install the module (and its `eth_rpc_module` dependency) and start a
    daemon.
-2. Read the seeded multi-chain config — Ethereum, Optimism, Arbitrum, Base.
+2. Read the seeded multi-chain config — Ethereum, Sepolia, Optimism, Arbitrum,
+   Base.
 3. Configure a local chain and ask for a token price: the module builds a
    Multicall3 batch, issues one `eth_call` through `eth_rpc_module` to the mock
    node, decodes the pool reserves, and reports the USD price — a real
    `get_prices` round-trip.
+4. Quote a swap for an account and build it: one more Multicall3 batch reads
+   the route quotes, a price-impact probe, the account's balance and its
+   allowance — and the reply carries the approve-then-swap calls a sender
+   needs, with a price impact and a gas hint for each.
 
-**What you'll build:** This `uniswap_module`, packaged as `.lgx`, installed with `lgpm` alongside `eth_rpc_module`, and driven through a `logoscore` daemon against a local mock node.
+**What you'll build:** This `uniswap_module`, packaged as `.lgx`, installed alongside `eth_rpc_module` into a `logosctl` session, and driven through its daemon against a local mock node: a price, a swap quote, and the swap's calls.
 
 **What you'll learn:**
 
 - How the module ships a seeded, configurable multi-chain Uniswap deployment map
 - How a token price is computed from a single Multicall3 batch issued via eth_rpc
 - How token→USD is anchored on a stablecoin/WETH rate
+- What a swap quote carries, and why the module builds calls rather than sending them
 
 ## Prerequisites
 
@@ -43,18 +50,26 @@ echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
 
 ---
 
-## Step 1: Build logoscore and lgpm
+## Step 1: Build logosctl
 
-### 1.1 Build logoscore
+### 1.1 Build logosctl
+
+`uniswap_module` is `concurrency: "multi"`, so the daemon resolves its
+deferred replies on the caller's behalf — it must be built against
+logos-protocol ≥ 0.2. logoscore-cli's own lock already satisfies that,
+so no `--override-input` is needed.
+
+The overrides that used to be here moved logos-protocol and
+logos-liblogos/logos-protocol but not logos-plugin-qt's. An override
+reaches only the input it names, and logos-qt-host bakes
+`sizeof(LogosAPIClient)` into its own `operator new` while logos-protocol
+defines the constructor -- so once protocol 4638634 grew that object
+88 -> 96 bytes, the pair disagreed and every getClient overran the heap:
+`free(): invalid next size` on glibc, silent on macOS. Completing the set
+instead trips logos-plugin-qt's own consumer-admission bound.
 
 ```bash
-nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
-```
-
-### 1.2 Build lgpm
-
-```bash
-nix build 'github:logos-co/logos-package-manager#cli' -o lgpm
+nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos
 ```
 
 ---
@@ -84,62 +99,116 @@ nix build 'github:logos-co/logos-evm-uniswap-module#lgx' -o uniswap-lgx
 ls uniswap-lgx/*.lgx
 ```
 
-### 2.3 Seed the capability module
+### 2.3 Start the daemon
+
+The session directory, `./session`, holds the daemon's config, its
+installed modules and their data. `--detach` returns once the daemon
+accepts commands.
 
 ```bash
-mkdir -p modules
-cp -RL ./logos/modules/. ./modules/
-
+logosctl daemon start --detach
 ```
 
-### 2.4 Install eth_rpc_module
+### 2.4 Install both .lgx
+
+A path ending in `.lgx` installs from disk, with no catalog involved. A
+local build is unsigned, which the session's default policy accepts with
+a warning. `-y` confirms, since there is no terminal to ask on.
 
 ```bash
-./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file eth-rpc-lgx/*.lgx
+logosctl install eth-rpc-lgx/*.lgx -y
+logosctl install uniswap-lgx/*.lgx -y
 ```
 
-### 2.5 Install uniswap_module
+### 2.5 Confirm the installs
 
 ```bash
-./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file uniswap-lgx/*.lgx
-```
-
-### 2.6 Confirm the installs
-
-```bash
-./lgpm/bin/lgpm --modules-dir ./modules list
+logosctl package ls
 ```
 
 ---
 
 ## Step 3: Start a mock JSON-RPC node
 
-A tiny local node that answers `eth_call` with a canned **Multicall3
-`aggregate3` result**: a single Uniswap V2 `getReserves` return of
-6,000,000 USDC against 2,000 WETH — i.e. 1 WETH = 3,000 USDC. The price the
-module reports is derived from exactly these reserves, so the round-trip is
-deterministic and offline.
+A tiny local node that plays one Uniswap V2 pool: 6,000,000 USDC against
+2,000 WETH — i.e. 1 WETH = 3,000 USDC. It decodes the **Multicall3
+`aggregate3`** batch the module sends and answers each sub-call from those
+reserves: `getReserves` for pricing, `getAmountsOut` for quotes (constant
+product, so a bigger trade gets a worse rate — that is the price impact),
+and the account reads `balanceOf` (5,000,000 USDC) and `allowance` (0). The
+figures the module reports are derived from exactly these numbers, so the
+round-trip is deterministic and offline.
 
 ### 3.1 Write the mock node
 
 ```
-import http.server, json
-# aggregate3([{success:true, returnData: getReserves()}]) with
-# reserve0 = 6_000_000e6 USDC, reserve1 = 2_000e18 WETH (1 WETH = 3000 USDC).
-AGG3 = "0x00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000574fbde600000000000000000000000000000000000000000000000006c6b935b8bbd4000000000000000000000000000000000000000000000000000000000000000000000"
-RES = {"eth_chainId": "0x7a69", "eth_call": AGG3, "eth_blockNumber": "0x10"}
+import http.server, json, socketserver, time
+R0, R1 = 6_000_000 * 10**6, 2_000 * 10**18   # USDC, WETH reserves
+def word(b, i): return int.from_bytes(b[32*i:32*i+32], 'big')
+def enc(*ws): return b''.join(w.to_bytes(32, 'big') for w in ws)
+def enc_bytes(b): return enc(len(b)) + b + b'\0' * (-len(b) % 32)
+def sub(data):                     # one Call3's callData -> its returnData
+    sel, args = data[:4].hex(), data[4:]
+    if sel == '0902f1ac':          # getReserves()
+        return enc(R0, R1, 0)
+    if sel == 'd06ca61f':          # getAmountsOut(amountIn, path[])
+        a = word(args, 0); n = word(args, word(args, 1) // 32)
+        out = R1 * a // (R0 + a)   # constant product, no fee
+        return enc(0x20, n, *([a] * (n - 1)), out)
+    if sel == '70a08231':          # balanceOf(owner)
+        return enc(5_000_000 * 10**6)
+    if sel == 'dd62ed3e':          # allowance(owner, spender)
+        return enc(0)
+    if sel == '4d2301cc':          # getEthBalance(addr)
+        return enc(10**18)
+    return None
+def aggregate3(calldata):          # aggregate3(Call3[]) -> Result3[]
+    body = calldata[4:]
+    arr = word(body, 0); n = word(body, arr // 32)
+    base = arr + 32; results = []
+    for i in range(n):
+        t = base + word(body, (base + 32 * i) // 32)
+        off = word(body, (t + 64) // 32); ln = word(body, (t + off) // 32)
+        ret = sub(body[t + off + 32:t + off + 32 + ln])
+        results.append((1, ret) if ret is not None else (0, b''))
+    # Result3 is a dynamic tuple: an offset per element, then (success, bytes).
+    elems = [enc(ok, 0x40) + enc_bytes(ret) for ok, ret in results]
+    offs, acc = [], 32 * n
+    for e in elems: offs.append(acc); acc += len(e)
+    return '0x' + (enc(0x20, n, *offs) + b''.join(elems)).hex()
+def eth_call(params):
+    call = params[0] if params else {}
+    data = bytes.fromhex((call.get('data') or call.get('input') or '0x')[2:])
+    return aggregate3(data) if data[:4].hex() == '82ad56cb' else '0x'
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get('content-length', 0))
         req = json.loads(self.rfile.read(n) or b'{}')
-        body = json.dumps({"jsonrpc": "2.0", "id": req.get("id", 1),
-                           "result": RES.get(req.get("method"), "0x0")}).encode()
+        m = req.get("method")
+        if m == "eth_call": res = eth_call(req.get("params", [{}]))
+        else: res = {"eth_chainId": "0x7a69", "eth_blockNumber": "0x10"}.get(m, "0x0")
+        body = json.dumps({"jsonrpc": "2.0", "id": req.get("id", 1), "result": res}).encode()
         self.send_response(200)
         self.send_header('content-length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
     def log_message(self, *a): pass
-http.server.HTTPServer(('127.0.0.1', 8601), H).serve_forever()
+# Threaded because uniswap_module is concurrency: "multi" and opens a fresh
+# connection per call, so a single-threaded server would serialise them.
+class Node(http.server.ThreadingHTTPServer):
+    # HTTPServer.server_bind() looks the host up in reverse DNS BETWEEN bind() and
+    # listen(), and nothing here needs the FQDN. Until that lookup answers the port
+    # is bound but not yet listening, so a caller's connect never completes; on a CI
+    # box whose resolver drops reverse queries for 127.0.0.1 that reads as an
+    # unreachable node. Same fix, same reason, as the eth-rpc-module spec.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+t0 = time.time()
+srv = Node(('127.0.0.1', 8601), H)
+host, port = srv.server_address[:2]
+print('listening on %s:%d after %.1fs' % (host, port, time.time() - t0), flush=True)
+srv.serve_forever()
 ```
 
 ### 3.2 Start the mock node
@@ -154,38 +223,30 @@ sleep 2
 
 ---
 
-## Step 4: Run the daemon and price a token
+## Step 4: Price a token
 
-### 4.1 Start the daemon
-
-```bash
-logoscore -D -m ./modules > logs.txt &
-```
+### 4.1 Load the modules
 
 ```bash
-sleep 3
+logosctl module load eth_rpc_module
+logosctl module load uniswap_module
 ```
 
-### 4.2 Load the modules
+### 4.2 Read the seeded multi-chain config
+
+The module ships sensible defaults for Ethereum, Sepolia (chainId
+11155111), Optimism, Arbitrum and Base (chainId 8453). Every V3 router
+in the seed is **SwapRouter02**.
 
 ```bash
-./logos/bin/logoscore load-module eth_rpc_module
-./logos/bin/logoscore load-module uniswap_module
-
+logosctl call uniswap_module get_chains
 ```
 
-### 4.3 Read the seeded multi-chain config
-
-The module ships sensible defaults for Ethereum, Optimism, Arbitrum and Base (chainId 8453).
-
-```bash
-logoscore call uniswap_module get_chains
-```
-
-### 4.4 Configure the local chain (Uniswap side: V2-only)
+### 4.3 Configure the local chain (Uniswap side: V2-only)
 
 A local chain `31337` with just a V2 deployment and USDC as the
-stablecoin — enough to price USDC→ETH from one pool read.
+stablecoin — enough to price USDC→ETH from one pool read, and to quote
+a USDC→ETH swap through the V2 router.
 
 ```json
 {
@@ -194,29 +255,30 @@ stablecoin — enough to price USDC→ETH from one pool read.
   "stablecoins": ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"],
   "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11",
   "v2Factory": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
-  "v2InitCodeHash": "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"
+  "v2InitCodeHash": "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f",
+  "v2Router": "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
 }
 ```
 
-### 4.5 Apply the Uniswap chain config
+### 4.4 Apply the Uniswap chain config
 
 ```bash
-logoscore call uniswap_module configure @uni_chain.json
+logosctl call uniswap_module configure @uni_chain.json
 ```
 
-### 4.6 Point eth_rpc chain 31337 at the mock node
+### 4.5 Point eth_rpc chain 31337 at the mock node
 
 ```json
 { "endpoint": "http://127.0.0.1:8601", "proxyRequired": false }
 ```
 
-### 4.7 Apply the eth_rpc chain config
+### 4.6 Apply the eth_rpc chain config
 
 ```bash
-logoscore call eth_rpc_module set_chain_config 31337 @rpc_chain.json
+logosctl call eth_rpc_module set_chain_config 31337 @rpc_chain.json
 ```
 
-### 4.8 Price USDC (Multicall3 round-trip through eth_rpc)
+### 4.7 Price USDC (Multicall3 round-trip through eth_rpc)
 
 `get_prices` builds the Multicall3 batch, issues one `eth_call` via
 `eth_rpc_module` to the mock node, decodes the V2 reserves, and reports
@@ -227,31 +289,83 @@ token→ETH and token→USD. With 1 WETH = 3,000 USDC, USDC anchors USD and
 { "tokens": [ { "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "decimals": 6 } ] }
 ```
 
-### 4.9 Call get_prices
+### 4.8 Call get_prices
 
 ```bash
-logoscore call uniswap_module get_prices 31337 @tokens.json
+logosctl call uniswap_module get_prices 31337 @tokens.json
 ```
 
-### 4.10 Stop the daemon and the mock node
+---
+
+## Step 5: Quote a swap and build it
+
+A swap request names the pair, the amount in base units, and the `owner`
+— the account that pays. With an owner the one Multicall3 batch also reads
+that account's balance of the input token and its allowance for the router,
+so the reply says whether the swap can be paid for and whether an
+**approval must go first**. Beside every route's quote rides a **probe** of a
+thousandth of the amount: its rate stands in for the marginal price, and
+the shortfall of the real rate against it is the **price impact**.
+
+### 5.1 Ask for 1,000 USDC worth of ether
+
+```json
+{
+  "tokenIn": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+  "tokenOut": "ETH",
+  "amountIn": "1000000000",
+  "owner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  "symbolIn": "USDC",
+  "symbolOut": "ETH"
+}
+```
+
+### 5.2 Quote the swap
+
+The winning route is V2 direct (the only one this chain has). The
+reply carries the output, the route, the pool fee, the price impact
+in basis points, a gas hint, and the owner's balance and allowance —
+which is zero, so `needsApproval` is `true`.
 
 ```bash
-./logos/bin/logoscore stop
-pkill -f mock_node.py 2>/dev/null || true
-
+logosctl call uniswap_module quote_swap 31337 @swap.json
 ```
+
+### 5.3 Build the swap
+
+The same quote, plus the calls that make it, **in the order they must
+land**: an exact-amount `approve` of USDC for the router, then the
+router call, with `amountOutMin` at the default 0.5% slippage. Each
+call carries a gas hint and a label; `tx_sender_module` takes this
+list as one bundle, and the keystore asks the human once for both.
 
 ```bash
-sleep 2
+logosctl call uniswap_module build_swap 31337 @swap.json
 ```
 
-### 4.11 Confirm the daemon has stopped
+### 5.4 An amount that is not a number is refused, not read as zero
 
 ```bash
-./logos/bin/logoscore status || true
+logosctl call uniswap_module quote_swap 31337 '{"tokenIn":"ETH","tokenOut":"0xA0b8…eB48","amountIn":"ten"}'
 ```
 
-The reported $3000 WETH price is computed entirely from the mock's
-reserves, decoded in-process — proof that the full path (Multicall3
-batch → `eth_rpc_module` → node → reserve maths → USD anchoring) runs
-end-to-end through the live module.
+---
+
+## Step 6: Stop everything
+
+### 6.1 Stop the daemon and the mock node
+
+```bash
+logosctl daemon stop
+```
+
+### 6.2 Confirm the daemon has stopped
+
+```bash
+logosctl daemon status
+```
+
+The reported $3000 WETH price and the 0.3333 ETH quote are computed
+entirely from the mock's reserves, decoded in-process — proof that the
+full path (Multicall3 batch → `eth_rpc_module` → node → reserve and
+quote maths → the swap's calls) runs end-to-end through the live module.
